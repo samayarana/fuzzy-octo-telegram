@@ -1,6 +1,11 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType } = require('discord.js');
 const { Riffy } = require('riffy');
+const express = require('express');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const OWNER_ID = '1092773378101882951';
 
 const client = new Client({
   intents: [
@@ -36,6 +41,26 @@ try {
 
 const startTime = Date.now();
 
+// Express Server
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    bot: client.user?.tag || 'Not Ready',
+    uptime: formatUptime(Date.now() - startTime),
+    servers: client.guilds.cache.size,
+    users: client.users.cache.size,
+    lavalink: lavalinkConnected ? 'connected' : 'disconnected'
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Date.now() - startTime });
+});
+
+app.listen(PORT, () => {
+  console.log(`Express server running on port ${PORT}`);
+});
+
 // Command aliases
 const commands = {
   play: ['play', 'p'],
@@ -55,7 +80,8 @@ const commands = {
   stats: ['stats', 'statistics'],
   support: ['support'],
   invite: ['invite', 'inv'],
-  vote: ['vote']
+  vote: ['vote'],
+  restart: ['restart'] // Owner only, not in help
 };
 
 client.once('ready', () => {
@@ -152,6 +178,26 @@ client.on('messageCreate', async (message) => {
   const command = getCommand(input);
 
   if (!command) return;
+
+  // RESTART Command (Owner Only)
+  if (command === 'restart') {
+    if (message.author.id !== OWNER_ID) {
+      const embed = new EmbedBuilder()
+        .setColor('#ff0000')
+        .setDescription('❌ This command is owner-only!');
+      return message.reply({ embeds: [embed] });
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor('#0099ff')
+      .setDescription('🔄 Restarting bot...');
+    
+    await message.reply({ embeds: [embed] });
+    
+    console.log('Bot restart initiated by owner');
+    await client.destroy();
+    process.exit(0);
+  }
 
   // Lavalink check for music commands
   const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume'];
@@ -456,11 +502,9 @@ client.on('messageCreate', async (message) => {
       )
       .setFooter({ text: `Requested by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() });
 
-    // Define the URLs (taken from your invite and support commands)
     const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot`;
-    const supportUrl = 'https://discord.gg/ynD2WcKQsv';
+    const supportUrl = 'https://discord.gg/MpXyChY5yw';
 
-    // Create the button row
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setLabel('Invite Me')
@@ -472,7 +516,6 @@ client.on('messageCreate', async (message) => {
         .setStyle(ButtonStyle.Link)
     );
 
-    // Send the message with the embed AND the buttons
     message.reply({ embeds: [embed], components: [row] });
   }
 
@@ -543,7 +586,7 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor('#0099ff')
       .setTitle('💬 Support Server')
-      .setDescription(`[Click here to join](https://discord.gg/ynD2WcKQsv)`)
+      .setDescription(`[Click here to join](https://discord.gg/MpXyChY5yw)`)
 
     message.reply({ embeds: [embed] });
   }
