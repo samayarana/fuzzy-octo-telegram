@@ -22,9 +22,9 @@ let lavalinkConnected = false;
 try {
   riffy = new Riffy(client, [
     {
-      host: process.env.LAVALINK_HOST || 'lava-v4.ajieblogs.eu.org',
-      port: parseInt(process.env.LAVALINK_PORT) || 80,
-      password: process.env.LAVALINK_PASSWORD || 'https://dsc.gg/ajidevserver',
+      host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+      port: parseInt(process.env.LAVALINK_PORT) || 13592,
+      password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
       secure: process.env.LAVALINK_SECURE === 'false'
     }
   ], {
