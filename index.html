@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Discord Music Bot - Professional Music Streaming</title>
+    <title>Drum - Professional Discord Music Bot</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         * {
@@ -382,7 +382,7 @@
                         <path d="M12 2C6.48 2 2 6.48 2 12C2 17.52 6.48 22 12 22C17.52 22 22 17.52 22 12C22 6.48 17.52 2 12 2ZM10 16.5V7.5L16 12L10 16.5Z" fill="#5865F2"/>
                     </svg>
                 </div>
-                <span id="navBotName">Music Bot</span>
+                <span id="navBotName">Drum</span>
             </div>
             <div id="statusBadge" class="status-badge loading">Loading...</div>
         </div>
@@ -560,7 +560,7 @@
     <footer>
         <div class="footer-content">
             <p class="footer-text">Built with precision for Discord communities worldwide</p>
-            <p class="footer-copyright">© 2024 Discord Music Bot. All rights reserved.</p>
+            <p class="footer-copyright">© 2024 Drum. All rights reserved.</p>
         </div>
     </footer>
 
@@ -573,7 +573,7 @@
                 const data = await response.json();
 
                 // Update bot info
-                const botName = data.bot || 'Music Bot';
+                const botName = data.bot || 'Drum';
                 document.getElementById('botName').textContent = botName;
                 document.getElementById('navBotName').textContent = botName;
                 
