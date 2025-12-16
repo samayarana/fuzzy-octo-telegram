@@ -2,7 +2,7 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType } = require('discord.js');
 const { Riffy } = require('riffy');
 const express = require('express');
-const path = require('path');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -43,16 +43,15 @@ try {
 const startTime = Date.now();
 
 // Express Server
-app.use(express.static('public'));
-
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  const html = fs.readFileSync('./index.html', 'utf8');
+  res.send(html);
 });
 
 app.get('/api/stats', (req, res) => {
   res.json({
     status: 'online',
-    bot: client.user?.tag || 'Not Ready',
+    bot: client.user?.tag || 'Drum',
     avatar: client.user?.displayAvatarURL() || '',
     uptime: formatUptime(Date.now() - startTime),
     servers: client.guilds.cache.size,
