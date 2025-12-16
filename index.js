@@ -2,6 +2,7 @@ require('dotenv').config();
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType } = require('discord.js');
 const { Riffy } = require('riffy');
 const express = require('express');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -25,7 +26,7 @@ try {
       host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
       port: parseInt(process.env.LAVALINK_PORT) || 13592,
       password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-      secure: process.env.LAVALINK_SECURE === 'false'
+      secure: process.env.LAVALINK_SECURE === 'true'
     }
   ], {
     send: (payload) => {
@@ -42,14 +43,24 @@ try {
 const startTime = Date.now();
 
 // Express Server
+app.use(express.static('public'));
+
 app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.get('/api/stats', (req, res) => {
   res.json({
     status: 'online',
     bot: client.user?.tag || 'Not Ready',
+    avatar: client.user?.displayAvatarURL() || '',
     uptime: formatUptime(Date.now() - startTime),
     servers: client.guilds.cache.size,
     users: client.users.cache.size,
-    lavalink: lavalinkConnected ? 'connected' : 'disconnected'
+    activePlayers: riffy ? riffy.players.size : 0,
+    lavalink: lavalinkConnected ? 'connected' : 'disconnected',
+    ping: Math.round(client.ws.ping),
+    memoryUsage: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)
   });
 });
 
