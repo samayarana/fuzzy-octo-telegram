@@ -646,8 +646,12 @@ client.on('messageCreate', async (message) => {
   // LOOP Command
   if (command === 'loop') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    if (!player || !player.current) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -659,12 +663,13 @@ client.on('messageCreate', async (message) => {
     state.loop = nextMode;
     playerStates.set(message.guild.id, state);
 
-    try {
-      if (player.setLoop) {
-        player.setLoop(nextMode === 'track' ? 'track' : nextMode === 'queue' ? 'queue' : 'none');
-      }
-    } catch (e) {
-      // Loop method might not be available, state is still tracked
+    // Set loop on player
+    if (nextMode === 'track') {
+      player.setLoop('track');
+    } else if (nextMode === 'queue') {
+      player.setLoop('queue');
+    } else {
+      player.setLoop('none');
     }
 
     const modeEmoji = { off: '➡️', track: '🔂', queue: '🔁' };
@@ -681,6 +686,10 @@ client.on('messageCreate', async (message) => {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
+      return message.reply({ embeds: [embed] });
+    }
 
     const state = playerStates.get(message.guild.id) || {};
     state.stay247 = !state.stay247;
@@ -695,8 +704,12 @@ client.on('messageCreate', async (message) => {
   // AUTOPLAY Command
   if (command === 'autoplay') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    if (!player || !player.current) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -704,13 +717,7 @@ client.on('messageCreate', async (message) => {
     state.autoplay = !state.autoplay;
     playerStates.set(message.guild.id, state);
 
-    try {
-      if (player.setAutoplay) {
-        player.setAutoplay(state.autoplay);
-      }
-    } catch (e) {
-      // Autoplay method might not be available in all Riffy versions
-    }
+    player.setAutoplay(state.autoplay);
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
@@ -725,16 +732,16 @@ client.on('messageCreate', async (message) => {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
       return message.reply({ embeds: [embed] });
     }
-
-    const queue = player.queue;
-    for (let i = queue.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [queue[i], queue[j]] = [queue[j], queue[i]];
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
+      return message.reply({ embeds: [embed] });
     }
+
+    player.queue.shuffle();
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
-      .setDescription(`🔀 Shuffled **${queue.length}** tracks!`);
+      .setDescription(`🔀 Shuffled **${player.queue.length}** tracks!`);
     message.reply({ embeds: [embed] });
   }
 
@@ -743,6 +750,10 @@ client.on('messageCreate', async (message) => {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -760,6 +771,10 @@ client.on('messageCreate', async (message) => {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -783,6 +798,10 @@ client.on('messageCreate', async (message) => {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -858,8 +877,12 @@ client.on('messageCreate', async (message) => {
   // FILTERS Command
   if (command === 'filters') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    if (!player || !player.current) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
+      return message.reply({ embeds: [embed] });
+    }
+    if (!message.member.voice.channel) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
       return message.reply({ embeds: [embed] });
     }
 
@@ -902,24 +925,12 @@ client.on('messageCreate', async (message) => {
 
       const filterName = i.values[0].replace('filter_', '');
 
-      try {
-        if (filterName === 'clear') {
-          if (player.clearFilters) {
-            player.clearFilters();
-            await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
-          } else {
-            await i.reply({ content: '⚠️ Filter clearing not supported on this player version', ephemeral: true });
-          }
-        } else {
-          if (player.setFilter) {
-            player.setFilter(filters[filterName]);
-            await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
-          } else {
-            await i.reply({ content: '⚠️ Filters not supported on this player version', ephemeral: true });
-          }
-        }
-      } catch (error) {
-        await i.reply({ content: '❌ Failed to apply filter', ephemeral: true });
+      if (filterName === 'clear') {
+        player.clearFilters();
+        await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
+      } else {
+        player.setFilter(filters[filterName]);
+        await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
       }
     });
 
@@ -933,22 +944,44 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`🎵 ${client.user.username} Commands`)
-      .setDescription(`Mention me with a command! Example: \`@${client.user.username} play song name\``)
+      .setDescription(`Mention me with a command! Example: \`@${client.user.username} play song name\`\n\u200b`)
       .setThumbnail(client.user.displayAvatarURL())
       .addFields(
         { 
           name: '🎵 Music Commands', 
-          value: '`play (p)` `search (find)` `pause` `resume (r)` `skip (s)` `stop (dc)` `queue (q)` `nowplaying (np)` `join` `leave` `volume (vol)` `loop` `shuffle (sh)` `autoplay (ap)` `247` `clearqueue (cq)` `remove (rm)` `move (mv)` `lyrics (ly)` `filters (fx)`',
+          value: [
+            '**Playback:**',
+            '`play (p)` • `search (find)` • `pause` • `resume (r)` • `skip (s)` • `stop (dc)`',
+            '',
+            '**Queue Management:**',
+            '`queue (q)` • `clearqueue (cq)` • `shuffle (sh)` • `remove (rm)` • `move (mv)`',
+            '',
+            '**Modes:**',
+            '`loop` • `autoplay (ap)` • `247` • `filters (fx)`',
+            '',
+            '**Other:**',
+            '`nowplaying (np)` • `join` • `leave` • `volume (vol)` • `lyrics (ly)`'
+          ].join('\n'),
+          inline: false
+        },
+        { 
+          name: '\u200b',
+          value: '\u200b',
           inline: false
         },
         { 
           name: '🔧 Utility Commands', 
-          value: '`ping` `uptime (ut)` `botinfo (bi)` `stats` `support` `invite (inv)` `vote`',
+          value: '`ping` • `uptime (ut)` • `botinfo (bi)` • `stats` • `support` • `invite (inv)` • `vote`',
           inline: false
         },
         { 
-          name: '📝 Note', 
-          value: 'Commands in parentheses are aliases you can use as shortcuts!',
+          name: '\u200b',
+          value: '\u200b',
+          inline: false
+        },
+        { 
+          name: '💡 Command Info', 
+          value: '• Commands in parentheses **(p, r, s)** are shortcuts\n• Use `@mention command` to interact with the bot',
           inline: false
         }
       )
