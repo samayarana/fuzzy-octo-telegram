@@ -195,6 +195,25 @@ if (riffy) {
       } catch (e) {}
     }
 
+    // Check for autoplay
+    if (state?.autoplay && player.current) {
+      try {
+        const identifier = player.current.info.identifier;
+        const search = await riffy.resolve({ query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`, requester: player.current.info.requester });
+        
+        if (search.tracks && search.tracks.length > 1) {
+          const track = search.tracks[Math.floor(Math.random() * Math.min(5, search.tracks.length))];
+          track.info.requester = player.current.info.requester;
+          player.queue.add(track);
+          if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}**`);
+          player.play();
+          return;
+        }
+      } catch (e) {
+        console.error('Autoplay error:', e);
+      }
+    }
+
     // Check for 24/7 mode
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
@@ -663,7 +682,7 @@ client.on('messageCreate', async (message) => {
     state.loop = nextMode;
     playerStates.set(message.guild.id, state);
 
-    // Set loop on player
+    // Set loop mode using Riffy's method
     if (nextMode === 'track') {
       player.setLoop('track');
     } else if (nextMode === 'queue') {
@@ -673,9 +692,15 @@ client.on('messageCreate', async (message) => {
     }
 
     const modeEmoji = { off: '➡️', track: '🔂', queue: '🔁' };
+    const modeDesc = { 
+      off: 'Loop disabled', 
+      track: 'Looping current track', 
+      queue: 'Looping entire queue' 
+    };
+    
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
-      .setDescription(`${modeEmoji[nextMode]} Loop mode: **${nextMode}**`);
+      .setDescription(`${modeEmoji[nextMode]} Loop: **${modeDesc[nextMode]}**`);
     message.reply({ embeds: [embed] });
   }
 
@@ -717,11 +742,12 @@ client.on('messageCreate', async (message) => {
     state.autoplay = !state.autoplay;
     playerStates.set(message.guild.id, state);
 
-    player.setAutoplay(state.autoplay);
+    // Riffy autoplay toggle
+    player.data.set('autoplay', state.autoplay);
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
-      .setDescription(`🔄 Autoplay: **${state.autoplay ? 'enabled' : 'disabled'}**`);
+      .setDescription(`🔄 Autoplay: **${state.autoplay ? 'enabled' : 'disabled'}**\n*Note: Bot will automatically play related songs when queue ends*`);
     message.reply({ embeds: [embed] });
   }
 
@@ -925,12 +951,25 @@ client.on('messageCreate', async (message) => {
 
       const filterName = i.values[0].replace('filter_', '');
 
-      if (filterName === 'clear') {
-        player.clearFilters();
-        await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
-      } else {
-        player.setFilter(filters[filterName]);
-        await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
+      try {
+        if (filterName === 'clear') {
+          // Clear all filters by sending empty filter object
+          await player.node.rest.updatePlayer({
+            guildId: player.guildId,
+            data: { filters: {} }
+          });
+          await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
+        } else {
+          // Apply selected filter
+          await player.node.rest.updatePlayer({
+            guildId: player.guildId,
+            data: { filters: filters[filterName] }
+          });
+          await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
+        }
+      } catch (error) {
+        console.error('Filter error:', error);
+        await i.reply({ content: '❌ Failed to apply filter. Please try again.', ephemeral: true });
       }
     });
 
