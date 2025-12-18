@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 // Configuration
 const config = {
-  ownerId: process.env.OWNER_ID || '1205161540022439937',
+  ownerId: process.env.OWNER_ID || '1092773378101882951',
   supportServer: process.env.SUPPORT_SERVER || 'https://discord.gg/MpXyChY5yw',
   voteLink: process.env.VOTE_LINK || 'https://top.gg/bot/1450084513513341050/vote',
   color: {
@@ -659,7 +659,13 @@ client.on('messageCreate', async (message) => {
     state.loop = nextMode;
     playerStates.set(message.guild.id, state);
 
-    player.setLoop(nextMode === 'track' ? 'track' : nextMode === 'queue' ? 'queue' : 'none');
+    try {
+      if (player.setLoop) {
+        player.setLoop(nextMode === 'track' ? 'track' : nextMode === 'queue' ? 'queue' : 'none');
+      }
+    } catch (e) {
+      // Loop method might not be available, state is still tracked
+    }
 
     const modeEmoji = { off: '➡️', track: '🔂', queue: '🔁' };
     const embed = new EmbedBuilder()
@@ -698,7 +704,13 @@ client.on('messageCreate', async (message) => {
     state.autoplay = !state.autoplay;
     playerStates.set(message.guild.id, state);
 
-    player.setAutoplay(state.autoplay);
+    try {
+      if (player.setAutoplay) {
+        player.setAutoplay(state.autoplay);
+      }
+    } catch (e) {
+      // Autoplay method might not be available in all Riffy versions
+    }
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
@@ -890,12 +902,24 @@ client.on('messageCreate', async (message) => {
 
       const filterName = i.values[0].replace('filter_', '');
 
-      if (filterName === 'clear') {
-        player.clearFilters();
-        await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
-      } else {
-        player.setFilter(filters[filterName]);
-        await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
+      try {
+        if (filterName === 'clear') {
+          if (player.clearFilters) {
+            player.clearFilters();
+            await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
+          } else {
+            await i.reply({ content: '⚠️ Filter clearing not supported on this player version', ephemeral: true });
+          }
+        } else {
+          if (player.setFilter) {
+            player.setFilter(filters[filterName]);
+            await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
+          } else {
+            await i.reply({ content: '⚠️ Filters not supported on this player version', ephemeral: true });
+          }
+        }
+      } catch (error) {
+        await i.reply({ content: '❌ Failed to apply filter', ephemeral: true });
       }
     });
 
@@ -919,12 +943,7 @@ client.on('messageCreate', async (message) => {
         },
         { 
           name: '🔧 Utility Commands', 
-          value: '`ping` `uptime (ut)` `botinfo (bi)` `stats`',
-          inline: false
-        },
-        { 
-          name: '🔗 Links', 
-          value: '`support` `invite (inv)` `vote`',
+          value: '`ping` `uptime (ut)` `botinfo (bi)` `stats` `support` `invite (inv)` `vote`',
           inline: false
         },
         { 
@@ -1036,11 +1055,10 @@ client.on('messageCreate', async (message) => {
 
   // VOTE Command
   if (command === 'vote') {
-    const voteLink = config.voteLink.includes('bot') ? config.voteLink : `${config.voteLink}/${client.user.id}/vote`;
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`🗳️ Vote for ${client.user.username}!`)
-      .setDescription(`[Vote on Top.gg](${voteLink})`)
+      .setDescription(`[Vote on Top.gg](${config.voteLink})`)
 
     message.reply({ embeds: [embed] });
   }
