@@ -111,15 +111,27 @@ const commands = {
 // Available filters
 const filters = {
   '8d': { rotation: { rotationHz: 0.2 } },
-  'bassboost': { equalizer: [{ band: 0, gain: 0.6 }, { band: 1, gain: 0.67 }, { band: 2, gain: 0.67 }] },
-  'nightcore': { timescale: { speed: 1.2, pitch: 1.2, rate: 1 } },
-  'vaporwave': { timescale: { speed: 0.8, pitch: 0.8, rate: 1 } },
+  'bassboost': { equalizer: [
+    { band: 0, gain: 0.2 },
+    { band: 1, gain: 0.15 },
+    { band: 2, gain: 0.1 },
+    { band: 3, gain: 0.05 }
+  ]},
+  'nightcore': { timescale: { speed: 1.3, pitch: 1.3, rate: 1 }, tremolo: { frequency: 2.0, depth: 0.5 } },
+  'vaporwave': { equalizer: [{ band: 1, gain: 0.3 }, { band: 0, gain: 0.3 }], timescale: { pitch: 0.5 }, tremolo: { frequency: 14.0, depth: 0.5 } },
   'karaoke': { karaoke: { level: 1.0, monoLevel: 1.0, filterBand: 220.0, filterWidth: 100.0 } },
   'soft': { lowPass: { smoothing: 20.0 } },
-  'treble': { equalizer: [{ band: 13, gain: 0.3 }, { band: 14, gain: 0.3 }] },
-  'pop': { equalizer: [{ band: 0, gain: 0.2 }, { band: 1, gain: 0.3 }, { band: 2, gain: 0.2 }] },
-  'party': { timescale: { speed: 1.1, pitch: 1.0, rate: 1.0 } },
-  'vibrato': { vibrato: { frequency: 4.0, depth: 0.75 } }
+  'treble': { equalizer: [{ band: 13, gain: 0.25 }, { band: 14, gain: 0.25 }] },
+  'pop': { equalizer: [
+    { band: 0, gain: 0.15 },
+    { band: 1, gain: 0.1 },
+    { band: 2, gain: 0.05 }
+  ]},
+  'party': { equalizer: [
+    { band: 0, gain: 0.1 },
+    { band: 1, gain: 0.15 }
+  ], timescale: { speed: 1.15, pitch: 1.0, rate: 1.0 } },
+  'vibrato': { vibrato: { frequency: 10.0, depth: 0.9 } }
 };
 
 client.once('ready', () => {
@@ -159,6 +171,11 @@ if (riffy) {
     const channel = client.channels.cache.get(player.textChannel);
     if (!channel) return;
 
+    // Store previous track for autoplay
+    if (player.current) {
+      player.previousTrack = player.current;
+    }
+
     const embed = new EmbedBuilder()
       .setColor(config.color.success)
       .setTitle('🎵 Now Playing')
@@ -196,21 +213,60 @@ if (riffy) {
     }
 
     // Check for autoplay
-    if (state?.autoplay && player.current) {
-      try {
-        const identifier = player.current.info.identifier;
-        const search = await riffy.resolve({ query: `https://www.youtube.com/watch?v=${identifier}&list=RD${identifier}`, requester: player.current.info.requester });
-        
-        if (search.tracks && search.tracks.length > 1) {
-          const track = search.tracks[Math.floor(Math.random() * Math.min(5, search.tracks.length))];
-          track.info.requester = player.current.info.requester;
-          player.queue.add(track);
-          if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}**`);
-          player.play();
-          return;
+    if (state?.autoplay) {
+      const previousTrack = player.previousTrack || player.current;
+      if (previousTrack && previousTrack.info) {
+        try {
+          if (channel) channel.send('🔄 Autoplay is finding similar tracks...');
+          
+          // Try to get YouTube mix/related tracks
+          const query = `https://www.youtube.com/watch?v=${previousTrack.info.identifier}`;
+          const search = await riffy.resolve({ 
+            query: query,
+            requester: previousTrack.info.requester 
+          });
+          
+          if (search && search.tracks && search.tracks.length > 1) {
+            // Get a random track from results (skip first as it's usually the same)
+            const randomIndex = Math.floor(Math.random() * Math.min(search.tracks.length - 1, 5)) + 1;
+            const track = search.tracks[randomIndex];
+            
+            if (track && track.info) {
+              track.info.requester = previousTrack.info.requester;
+              player.queue.add(track);
+              if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}** by ${track.info.author}`);
+              
+              if (!player.playing) {
+                player.play();
+              }
+              return;
+            }
+          }
+          
+          // Fallback: search for similar songs
+          const searchQuery = `${previousTrack.info.author} ${previousTrack.info.title}`;
+          const fallbackSearch = await riffy.resolve({ 
+            query: searchQuery,
+            requester: previousTrack.info.requester 
+          });
+          
+          if (fallbackSearch && fallbackSearch.tracks && fallbackSearch.tracks.length > 1) {
+            const track = fallbackSearch.tracks[1]; // Get second result
+            track.info.requester = previousTrack.info.requester;
+            player.queue.add(track);
+            if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}** by ${track.info.author}`);
+            
+            if (!player.playing) {
+              player.play();
+            }
+            return;
+          }
+          
+          if (channel) channel.send('❌ Autoplay: Could not find similar tracks.');
+        } catch (error) {
+          console.error('Autoplay error:', error);
+          if (channel) channel.send('❌ Autoplay: Failed to fetch related tracks.');
         }
-      } catch (e) {
-        console.error('Autoplay error:', e);
       }
     }
 
@@ -935,7 +991,12 @@ client.on('messageCreate', async (message) => {
       .setColor(config.color.info)
       .setTitle('🎚️ Audio Filters')
       .setDescription('**Available Filters:**\n' + Object.keys(filters).map(f => `• **${f}**`).join('\n'))
-      .setFooter({ text: '⚠️ This menu will expire in 5 minutes' });
+      .addFields({
+        name: '⚠️ Important Note',
+        value: 'Filters are applied to the Lavalink server. Some filters may take a moment to activate or may not be supported by your Lavalink version.',
+        inline: false
+      })
+      .setFooter({ text: 'This menu will expire in 5 minutes' });
 
     const msg = await message.reply({ embeds: [embed], components: [row] });
 
@@ -953,23 +1014,28 @@ client.on('messageCreate', async (message) => {
 
       try {
         if (filterName === 'clear') {
-          // Clear all filters by sending empty filter object
+          // Clear all filters
           await player.node.rest.updatePlayer({
             guildId: player.guildId,
-            data: { filters: {} }
+            data: { 
+              filters: {}
+            }
           });
           await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
         } else {
           // Apply selected filter
+          const filterData = filters[filterName];
           await player.node.rest.updatePlayer({
             guildId: player.guildId,
-            data: { filters: filters[filterName] }
+            data: { 
+              filters: filterData
+            }
           });
-          await i.reply({ content: `✅ Applied **${filterName}** filter!`, ephemeral: true });
+          await i.reply({ content: `✅ Applied **${filterName}** filter! The effect may take a moment to activate.`, ephemeral: true });
         }
       } catch (error) {
         console.error('Filter error:', error);
-        await i.reply({ content: '❌ Failed to apply filter. Please try again.', ephemeral: true });
+        await i.reply({ content: `❌ Failed to apply filter: ${error.message || 'Unknown error'}`, ephemeral: true });
       }
     });
 
