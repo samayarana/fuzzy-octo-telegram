@@ -36,7 +36,7 @@ try {
       host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
       port: parseInt(process.env.LAVALINK_PORT) || 13592,
       password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-      secure: process.env.LAVALINK_SECURE === 'false'
+      secure: process.env.LAVALINK_SECURE === 'true'
     }
   ], {
     send: (payload) => {
@@ -171,11 +171,6 @@ if (riffy) {
     const channel = client.channels.cache.get(player.textChannel);
     if (!channel) return;
 
-    // Store previous track for autoplay
-    if (player.current) {
-      player.previousTrack = player.current;
-    }
-
     const embed = new EmbedBuilder()
       .setColor(config.color.success)
       .setTitle('🎵 Now Playing')
@@ -212,64 +207,6 @@ if (riffy) {
       } catch (e) {}
     }
 
-    // Check for autoplay
-    if (state?.autoplay) {
-      const previousTrack = player.previousTrack || player.current;
-      if (previousTrack && previousTrack.info) {
-        try {
-          if (channel) channel.send('🔄 Autoplay is finding similar tracks...');
-          
-          // Try to get YouTube mix/related tracks
-          const query = `https://www.youtube.com/watch?v=${previousTrack.info.identifier}`;
-          const search = await riffy.resolve({ 
-            query: query,
-            requester: previousTrack.info.requester 
-          });
-          
-          if (search && search.tracks && search.tracks.length > 1) {
-            // Get a random track from results (skip first as it's usually the same)
-            const randomIndex = Math.floor(Math.random() * Math.min(search.tracks.length - 1, 5)) + 1;
-            const track = search.tracks[randomIndex];
-            
-            if (track && track.info) {
-              track.info.requester = previousTrack.info.requester;
-              player.queue.add(track);
-              if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}** by ${track.info.author}`);
-              
-              if (!player.playing) {
-                player.play();
-              }
-              return;
-            }
-          }
-          
-          // Fallback: search for similar songs
-          const searchQuery = `${previousTrack.info.author} ${previousTrack.info.title}`;
-          const fallbackSearch = await riffy.resolve({ 
-            query: searchQuery,
-            requester: previousTrack.info.requester 
-          });
-          
-          if (fallbackSearch && fallbackSearch.tracks && fallbackSearch.tracks.length > 1) {
-            const track = fallbackSearch.tracks[1]; // Get second result
-            track.info.requester = previousTrack.info.requester;
-            player.queue.add(track);
-            if (channel) channel.send(`🔄 Autoplay: Added **${track.info.title}** by ${track.info.author}`);
-            
-            if (!player.playing) {
-              player.play();
-            }
-            return;
-          }
-          
-          if (channel) channel.send('❌ Autoplay: Could not find similar tracks.');
-        } catch (error) {
-          console.error('Autoplay error:', error);
-          if (channel) channel.send('❌ Autoplay: Failed to fetch related tracks.');
-        }
-      }
-    }
-
     // Check for 24/7 mode
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
@@ -279,6 +216,61 @@ if (riffy) {
     if (channel) channel.send('Queue ended. Leaving voice channel.');
     player.destroy();
     playerStates.delete(player.guildId);
+  });
+
+  riffy.on('trackEnd', async (player, track) => {
+    const state = playerStates.get(player.guildId);
+    const channel = client.channels.cache.get(player.textChannel);
+
+    // Check for autoplay when track ends and queue is empty
+    if (state?.autoplay && player.queue.length === 0 && track) {
+      try {
+        console.log('[AUTOPLAY] Attempting to find related track...');
+
+        // Search for related tracks using YouTube search
+        const searchQuery = `${track.info.author} - ${track.info.title}`;
+        console.log('[AUTOPLAY] Search query:', searchQuery);
+
+        const search = await riffy.resolve({ 
+          query: searchQuery,
+          requester: track.info.requester 
+        });
+
+        console.log('[AUTOPLAY] Search result:', search.loadType, 'Tracks found:', search.tracks?.length);
+
+        if (search && search.tracks && search.tracks.length > 0) {
+          // Get a random track from first 5 results (excluding exact same track)
+          const availableTracks = search.tracks.slice(0, 5).filter(t => t.info.identifier !== track.info.identifier);
+
+          if (availableTracks.length > 0) {
+            const randomTrack = availableTracks[Math.floor(Math.random() * availableTracks.length)];
+            randomTrack.info.requester = track.info.requester;
+
+            player.queue.add(randomTrack);
+            console.log('[AUTOPLAY] Added track:', randomTrack.info.title);
+
+            if (channel) {
+              channel.send(`🔄 **Autoplay:** Added **${randomTrack.info.title}** by **${randomTrack.info.author}**`);
+            }
+
+            // Start playing if not already playing
+            if (!player.playing) {
+              player.play();
+              console.log('[AUTOPLAY] Started playing');
+            }
+          } else {
+            console.log('[AUTOPLAY] No different tracks found');
+            if (channel) channel.send('❌ Autoplay: Could not find different tracks.');
+          }
+        } else {
+          console.log('[AUTOPLAY] No search results');
+          if (channel) channel.send('❌ Autoplay: No related tracks found.');
+        }
+      } catch (error) {
+        console.error('[AUTOPLAY] Error:', error);
+        if (channel) channel.send('❌ Autoplay: An error occurred while fetching tracks.');
+      }
+    }
   });
 }
 
@@ -313,9 +305,9 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setDescription('🔄 Restarting bot...');
-    
+
     await message.reply({ embeds: [embed] });
-    
+
     console.log('Bot restart initiated by owner');
     await client.destroy();
     process.exit(0);
@@ -706,7 +698,7 @@ client.on('messageCreate', async (message) => {
     }
 
     const volume = parseInt(args[1]);
-    if (!volume || volume < 0 || volume > 100) {
+    if (isNaN(volume) || volume < 0 || volume > 100) {
       const embed = new EmbedBuilder()
         .setColor(config.color.info)
         .setDescription(`🔊 Current volume: **${player.volume}%**\n\nUsage: \`@${client.user.username} volume <0-100>\``);
@@ -753,7 +745,7 @@ client.on('messageCreate', async (message) => {
       track: 'Looping current track', 
       queue: 'Looping entire queue' 
     };
-    
+
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setDescription(`${modeEmoji[nextMode]} Loop: **${modeDesc[nextMode]}**`);
@@ -936,7 +928,7 @@ client.on('messageCreate', async (message) => {
 
       const song = data[0];
       let lyrics = song.plainLyrics || song.syncedLyrics || 'Lyrics not available';
-      
+
       if (lyrics.length > 4000) {
         lyrics = lyrics.substring(0, 4000) + '...';
       }
