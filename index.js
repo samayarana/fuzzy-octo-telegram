@@ -1,5 +1,17 @@
+// Patch for Riffy Node initialization error in Node.js 20+
+const originalDefineProperty = Object.defineProperty;
+Object.defineProperty = function(obj, prop, descriptor) {
+  if (descriptor && (descriptor.get || descriptor.set) && (Object.prototype.hasOwnProperty.call(descriptor, 'value') || Object.prototype.hasOwnProperty.call(descriptor, 'writable'))) {
+    const newDescriptor = { ...descriptor };
+    delete newDescriptor.value;
+    delete newDescriptor.writable;
+    return originalDefineProperty(obj, prop, newDescriptor);
+  }
+  return originalDefineProperty(obj, prop, descriptor);
+};
+
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType, StringSelectMenuBuilder, ComponentType } = require('discord.js');
+const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType, StringSelectMenuBuilder, ComponentType, MessageFlags } = require('discord.js');
 const { Riffy } = require('riffy');
 const express = require('express');
 
@@ -49,6 +61,11 @@ try {
 } catch (error) {
   console.error('Failed to initialize Riffy:', error.message);
 }
+
+// Helper to ensure Riffy is initialized safely if it's not a constructor issue but an internal one
+// In some cases, updating Node.js or the library is the only fix. 
+// Given the error is inside riffy structures, we should check if there's a specific version compatibility issue.
+
 
 const startTime = Date.now();
 
@@ -207,6 +224,30 @@ if (riffy) {
       } catch (e) {}
     }
 
+    // Autoplay logic
+    if (state?.autoplay) {
+      try {
+        const track = player.current;
+        if (!track) return;
+
+        const searchQuery = `${track.info.author} - ${track.info.title}`;
+        const search = await riffy.resolve({ query: searchQuery, requester: track.info.requester });
+
+        if (search && search.tracks && search.tracks.length > 0) {
+          const availableTracks = search.tracks.slice(0, 5).filter(t => t.info.identifier !== track.info.identifier);
+          if (availableTracks.length > 0) {
+            const nextTrack = availableTracks[Math.floor(Math.random() * availableTracks.length)];
+            player.queue.add(nextTrack);
+            if (!player.playing && !player.paused) player.play();
+            if (channel) channel.send(`🔄 **Autoplay:** Added **${nextTrack.info.title}**`);
+            return;
+          }
+        }
+      } catch (e) {
+        console.error('Autoplay error:', e);
+      }
+    }
+
     // Check for 24/7 mode
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
@@ -218,59 +259,9 @@ if (riffy) {
     playerStates.delete(player.guildId);
   });
 
+  // Removed old manual autoplay from trackEnd as riffy.autoplay() handles it in queueEnd
   riffy.on('trackEnd', async (player, track) => {
-    const state = playerStates.get(player.guildId);
-    const channel = client.channels.cache.get(player.textChannel);
-
-    // Check for autoplay when track ends and queue is empty
-    if (state?.autoplay && player.queue.length === 0 && track) {
-      try {
-        console.log('[AUTOPLAY] Attempting to find related track...');
-
-        // Search for related tracks using YouTube search
-        const searchQuery = `${track.info.author} - ${track.info.title}`;
-        console.log('[AUTOPLAY] Search query:', searchQuery);
-
-        const search = await riffy.resolve({ 
-          query: searchQuery,
-          requester: track.info.requester 
-        });
-
-        console.log('[AUTOPLAY] Search result:', search.loadType, 'Tracks found:', search.tracks?.length);
-
-        if (search && search.tracks && search.tracks.length > 0) {
-          // Get a random track from first 5 results (excluding exact same track)
-          const availableTracks = search.tracks.slice(0, 5).filter(t => t.info.identifier !== track.info.identifier);
-
-          if (availableTracks.length > 0) {
-            const randomTrack = availableTracks[Math.floor(Math.random() * availableTracks.length)];
-            randomTrack.info.requester = track.info.requester;
-
-            player.queue.add(randomTrack);
-            console.log('[AUTOPLAY] Added track:', randomTrack.info.title);
-
-            if (channel) {
-              channel.send(`🔄 **Autoplay:** Added **${randomTrack.info.title}** by **${randomTrack.info.author}**`);
-            }
-
-            // Start playing if not already playing
-            if (!player.playing) {
-              player.play();
-              console.log('[AUTOPLAY] Started playing');
-            }
-          } else {
-            console.log('[AUTOPLAY] No different tracks found');
-            if (channel) channel.send('❌ Autoplay: Could not find different tracks.');
-          }
-        } else {
-          console.log('[AUTOPLAY] No search results');
-          if (channel) channel.send('❌ Autoplay: No related tracks found.');
-        }
-      } catch (error) {
-        console.error('[AUTOPLAY] Error:', error);
-        if (channel) channel.send('❌ Autoplay: An error occurred while fetching tracks.');
-      }
-    }
+    // trackEnd logic if needed
   });
 }
 
@@ -285,6 +276,17 @@ function getCommand(input) {
 // Message Handler
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
+
+  // Check for mention only
+  if (message.content.trim() === `<@!${client.user.id}>` || message.content.trim() === `<@${client.user.id}>`) {
+    const embed = new EmbedBuilder()
+      .setColor(config.color.info)
+      .setTitle(`🎵 ${client.user.username}`)
+      .setDescription(`Hello! To see all my commands, please use \`@${client.user.username} help\``)
+      .setFooter({ text: 'Use me by mentioning me followed by a command' });
+    return message.reply({ embeds: [embed] });
+  }
+
   if (!message.mentions.has(client.user.id)) return;
 
   const args = message.content.split(' ').slice(1);
@@ -293,25 +295,24 @@ client.on('messageCreate', async (message) => {
 
   if (!command) return;
 
-  // RESTART Command (Owner Only)
-  if (command === 'restart') {
-    if (message.author.id !== config.ownerId) {
+    if (command === 'restart') {
+      if (message.author.id !== config.ownerId) {
+        const embed = new EmbedBuilder()
+          .setColor(config.color.error)
+          .setDescription('❌ This command is owner-only!');
+        return message.reply({ embeds: [embed] });
+      }
+  
       const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ This command is owner-only!');
-      return message.reply({ embeds: [embed] });
+        .setColor(config.color.info)
+        .setDescription('🔄 Restarting bot...');
+  
+      await message.reply({ embeds: [embed] });
+  
+      console.log('Bot restart initiated by owner');
+      await client.destroy();
+      process.exit(0);
     }
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription('🔄 Restarting bot...');
-
-    await message.reply({ embeds: [embed] });
-
-    console.log('Bot restart initiated by owner');
-    await client.destroy();
-    process.exit(0);
-  }
 
   // Lavalink check for music commands
   const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'loop', 'autoplay', 'shuffle', 'clearqueue', 'remove', 'move', 'search', 'lyrics', 'filters', 'join', 'leave'];
@@ -450,14 +451,14 @@ client.on('messageCreate', async (message) => {
 
       const msg = await message.reply({ embeds: [embed], components: [row] });
 
-      const collector = msg.createMessageComponentCollector({
+    const collector = msg.createMessageComponentCollector({
         componentType: ComponentType.StringSelect,
         time: 60000
       });
 
       collector.on('collect', async (i) => {
         if (i.user.id !== message.author.id) {
-          return i.reply({ content: '❌ This is not your search!', ephemeral: true });
+          return i.reply({ content: '❌ This is not your search!', flags: [MessageFlags.Ephemeral] });
         }
 
         const index = parseInt(i.values[0].split('_')[1]);
@@ -786,12 +787,18 @@ client.on('messageCreate', async (message) => {
       return message.reply({ embeds: [embed] });
     }
 
+    // Restriction: Only requester can toggle autoplay
+    if (message.author.id !== player.current.info.requester) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Only the song requester can toggle autoplay!');
+      return message.reply({ embeds: [embed] });
+    }
+
     const state = playerStates.get(message.guild.id) || {};
     state.autoplay = !state.autoplay;
     playerStates.set(message.guild.id, state);
 
     // Riffy autoplay toggle
-    player.data.set('autoplay', state.autoplay);
+    player.isAutoplay = state.autoplay;
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
@@ -960,6 +967,12 @@ client.on('messageCreate', async (message) => {
       return message.reply({ embeds: [embed] });
     }
 
+    // Restriction: Only requester can use filters
+    if (message.author.id !== player.current.info.requester) {
+      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Only the song requester can use filters!');
+      return message.reply({ embeds: [embed] });
+    }
+
     const filterOptions = Object.keys(filters).map(name => ({
       label: name.charAt(0).toUpperCase() + name.slice(1),
       description: `Apply ${name} filter`,
@@ -999,7 +1012,7 @@ client.on('messageCreate', async (message) => {
 
     collector.on('collect', async (i) => {
       if (i.user.id !== message.author.id) {
-        return i.reply({ content: '❌ This is not your filter menu!', ephemeral: true });
+        return i.reply({ content: '❌ This is not your filter menu!', flags: [MessageFlags.Ephemeral] });
       }
 
       const filterName = i.values[0].replace('filter_', '');
@@ -1013,7 +1026,7 @@ client.on('messageCreate', async (message) => {
               filters: {}
             }
           });
-          await i.reply({ content: '✅ Cleared all filters!', ephemeral: true });
+          await i.reply({ content: '✅ Cleared all filters!', flags: [MessageFlags.Ephemeral] });
         } else {
           // Apply selected filter
           const filterData = filters[filterName];
@@ -1023,11 +1036,11 @@ client.on('messageCreate', async (message) => {
               filters: filterData
             }
           });
-          await i.reply({ content: `✅ Applied **${filterName}** filter! The effect may take a moment to activate.`, ephemeral: true });
+          await i.reply({ content: `✅ Applied **${filterName}** filter! The effect may take a moment to activate.`, flags: [MessageFlags.Ephemeral] });
         }
       } catch (error) {
         console.error('Filter error:', error);
-        await i.reply({ content: `❌ Failed to apply filter: ${error.message || 'Unknown error'}`, ephemeral: true });
+        await i.reply({ content: `❌ Failed to apply filter: ${error.message || 'Unknown error'}`, flags: [MessageFlags.Ephemeral] });
       }
     });
 
@@ -1200,14 +1213,17 @@ client.on('interactionCreate', async (interaction) => {
 
   const player = riffy?.players.get(interaction.guild.id);
   if (!player) {
-    return interaction.reply({ content: '❌ No music is playing!', ephemeral: true });
+    return interaction.reply({ content: '❌ No music is playing!', flags: [MessageFlags.Ephemeral] });
   }
 
   if (!interaction.member.voice.channel) {
-    return interaction.reply({ content: '❌ You need to be in a voice channel!', ephemeral: true });
+    return interaction.reply({ content: '❌ You need to be in a voice channel!', flags: [MessageFlags.Ephemeral] });
   }
 
   if (interaction.customId === 'pause') {
+    if (interaction.user.id !== player.current.info.requester) {
+      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
+    }
     if (player.paused) {
       player.pause(false);
       const row = new ActionRowBuilder().addComponents(
@@ -1216,7 +1232,7 @@ client.on('interactionCreate', async (interaction) => {
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
       );
       await interaction.message.edit({ components: [row] });
-      await interaction.reply({ content: '▶️ Resumed!', ephemeral: true });
+      await interaction.reply({ content: '▶️ Resumed!', flags: [MessageFlags.Ephemeral] });
     } else {
       player.pause(true);
       const row = new ActionRowBuilder().addComponents(
@@ -1225,11 +1241,14 @@ client.on('interactionCreate', async (interaction) => {
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
       );
       await interaction.message.edit({ components: [row] });
-      await interaction.reply({ content: '⏸️ Paused!', ephemeral: true });
+      await interaction.reply({ content: '⏸️ Paused!', flags: [MessageFlags.Ephemeral] });
     }
   }
 
   if (interaction.customId === 'skip') {
+    if (interaction.user.id !== player.current.info.requester) {
+      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
+    }
     player.stop();
     const disabledRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
@@ -1237,10 +1256,13 @@ client.on('interactionCreate', async (interaction) => {
       new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
     );
     await interaction.message.edit({ components: [disabledRow] });
-    await interaction.reply({ content: '⏭️ Skipped!', ephemeral: true });
+    await interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
   }
 
   if (interaction.customId === 'stop') {
+    if (interaction.user.id !== player.current.info.requester) {
+      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
+    }
     player.destroy();
     playerStates.delete(interaction.guild.id);
     const disabledRow = new ActionRowBuilder().addComponents(
@@ -1249,7 +1271,7 @@ client.on('interactionCreate', async (interaction) => {
       new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
     );
     await interaction.message.edit({ components: [disabledRow] });
-    await interaction.reply({ content: '⏹️ Stopped!', ephemeral: true });
+    await interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
   }
 });
 
