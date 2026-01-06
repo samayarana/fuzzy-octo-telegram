@@ -302,13 +302,13 @@ client.on('messageCreate', async (message) => {
           .setDescription('❌ This command is owner-only!');
         return message.reply({ embeds: [embed] });
       }
-  
+
       const embed = new EmbedBuilder()
         .setColor(config.color.info)
         .setDescription('🔄 Restarting bot...');
-  
+
       await message.reply({ embeds: [embed] });
-  
+
       console.log('Bot restart initiated by owner');
       await client.destroy();
       process.exit(0);
