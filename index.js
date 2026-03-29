@@ -33,8 +33,9 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.MessageContent // FIX: Required to read message content
+    GatewayIntentBits.GuildVoiceStates
+    // MessageContent intent NOT needed — bot uses @mention commands,
+    // and Discord always includes content when the bot itself is mentioned.
   ]
 });
 
