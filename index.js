@@ -46,7 +46,7 @@ try {
   riffy = new Riffy(client, [
     {
       host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
-      port: parseInt(process.env.LAVALINK_PORT) || 442,
+      port: parseInt(process.env.LAVALINK_PORT) || 443,
       password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
       secure: process.env.LAVALINK_SECURE === 'true'
     }
