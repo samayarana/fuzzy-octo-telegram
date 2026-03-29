@@ -48,7 +48,7 @@ try {
       host: process.env.LAVALINK_HOST || 'api.hxstudios.fun',
       port: parseInt(process.env.LAVALINK_PORT) || 2001,
       password: process.env.LAVALINK_PASSWORD || 'HXDevIsHere',
-      secure: process.env.LAVALINK_SECURE === 'true'
+      secure: process.env.LAVALINK_SECURE === 'false'
     }
   ], {
     send: (payload) => {
