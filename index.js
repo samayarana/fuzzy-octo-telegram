@@ -45,10 +45,10 @@ let lavalinkConnected = false;
 try {
   riffy = new Riffy(client, [
     {
-      host: process.env.LAVALINK_HOST || 'api.hxstudios.fun',
-      port: parseInt(process.env.LAVALINK_PORT) || 2001,
-      password: process.env.LAVALINK_PASSWORD || 'HXDevIsHere',
-      secure: process.env.LAVALINK_SECURE === 'false'
+      host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+      port: parseInt(process.env.LAVALINK_PORT) || 442,
+      password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+      secure: process.env.LAVALINK_SECURE === 'true'
     }
   ], {
     send: (payload) => {
