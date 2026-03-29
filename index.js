@@ -21,7 +21,7 @@ const PORT = process.env.PORT || 3000;
 // Configuration
 const config = {
   ownerId: process.env.OWNER_ID || '1092773378101882951',
-  supportServer: process.env.SUPPORT_SERVER || 'https://discord.gg/MpXyChY5yw',
+  supportServer: process.env.SUPPORT_SERVER || 'https://discord.gg/su57JWf2V5',
   voteLink: process.env.VOTE_LINK || 'https://top.gg/bot/1450084513513341050/vote',
   color: {
     success: '#00ff00',
@@ -45,10 +45,10 @@ let lavalinkConnected = false;
 try {
   riffy = new Riffy(client, [
     {
-      host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
-      port: parseInt(process.env.LAVALINK_PORT) || 443,
-      password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-      secure: process.env.LAVALINK_SECURE === 'true'
+      host: process.env.LAVALINK_HOST || 'lavalinkv4.serenetia.com',
+      port: parseInt(process.env.LAVALINK_PORT) || 80,
+      password: process.env.LAVALINK_PASSWORD || 'https://seretia.link/discord',
+      secure: process.env.LAVALINK_SECURE === 'false'
     }
   ], {
     send: (payload) => {
