@@ -30,6 +30,16 @@ const config = {
   }
 };
 
+// Lavalink node configuration (extracted for reuse during reconnect)
+const lavalinkNodes = [
+  {
+    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+    port: parseInt(process.env.LAVALINK_PORT) || 13592,
+    password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+    secure: process.env.LAVALINK_SECURE === 'false'
+  }
+];
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -40,115 +50,114 @@ const client = new Client({
 
 let riffy;
 let lavalinkConnected = false;
+let lavalinkReconnectTimer = null;   // Holds the setInterval reference
+let isReconnecting = false;          // Prevents overlapping reconnect attempts
 
-// Initialize Riffy with error handling
-try {
-  riffy = new Riffy(client, [
-    {
-      host: process.env.LAVALINK_HOST || '217.160.125.125',
-      port: parseInt(process.env.LAVALINK_PORT) || 10252,
-      password: process.env.LAVALINK_PASSWORD || 'iamprmgvyt',
-      secure: process.env.LAVALINK_SECURE === 'false'
-    }
-  ], {
-    send: (payload) => {
-      const guild = client.guilds.cache.get(payload.d.guild_id);
-      if (guild) guild.shard.send(payload);
-    },
-    defaultSearchPlatform: 'ytmsearch',
-    restVersion: 'v4'
-  });
-} catch (error) {
-  console.error('Failed to initialize Riffy:', error.message);
+// ─────────────────────────────────────────────────────────────
+//  Lavalink Reconnect Logic
+//  • Runs every 2–3 minutes (random jitter to avoid thundering herd)
+//  • Stops automatically once Lavalink comes back online
+// ─────────────────────────────────────────────────────────────
+function getRandomInterval() {
+  // Random ms between 2 min (120 000) and 3 min (180 000)
+  return Math.floor(Math.random() * 60_000) + 120_000;
 }
 
-const startTime = Date.now();
+function startLavalinkReconnect() {
+  if (lavalinkReconnectTimer) return; // Already running
 
-// Player states for 24/7
-const playerStates = new Map();
+  console.log('[Lavalink] Starting auto-reconnect loop (every 2–3 minutes)...');
 
-// Express Server
-app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    bot: client.user?.tag || 'Not Ready',
-    uptime: formatUptime(Date.now() - startTime),
-    servers: client.guilds.cache.size,
-    users: client.users.cache.size,
-    lavalink: lavalinkConnected ? 'connected' : 'disconnected'
-  });
-});
+  function scheduleNext() {
+    const delay = getRandomInterval();
+    console.log(`[Lavalink] Next reconnect attempt in ${Math.round(delay / 1000)}s`);
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: Date.now() - startTime });
-});
+    lavalinkReconnectTimer = setTimeout(async () => {
+      lavalinkReconnectTimer = null;
 
-app.listen(PORT, () => {
-  console.log(`Express server running on port ${PORT}`);
-});
+      if (lavalinkConnected) {
+        console.log('[Lavalink] Already connected — stopping reconnect loop.');
+        isReconnecting = false;
+        return;
+      }
 
-// Command aliases
-const commands = {
-  play: ['play', 'p'],
-  pause: ['pause'],
-  resume: ['resume', 'r'],
-  skip: ['skip', 's', 'next'],
-  stop: ['stop', 'disconnect', 'dc'],
-  queue: ['queue', 'q'],
-  nowplaying: ['nowplaying', 'np', 'current'],
-  join: ['join', 'connect'],
-  leave: ['leave'],
-  volume: ['volume', 'vol', 'v'],
-  loop: ['loop', 'repeat'],
-  shuffle: ['shuffle', 'sh'],
-  clearqueue: ['clearqueue', 'cq', 'clear'],
-  remove: ['remove', 'rm'],
-  move: ['move', 'mv'],
-  search: ['search', 'find'],
-  lyrics: ['lyrics', 'ly'],
-  '247': ['247', '24/7', 'stay'],
-  help: ['help', 'h', 'commands'],
-  ping: ['ping'],
-  uptime: ['uptime', 'ut'],
-  botinfo: ['botinfo', 'bi', 'info'],
-  stats: ['stats', 'statistics'],
-  support: ['support'],
-  invite: ['invite', 'inv'],
-  vote: ['vote'],
-  restart: ['restart']
-};
+      if (isReconnecting) {
+        scheduleNext();
+        return;
+      }
 
-client.once('ready', () => {
-  if (riffy) riffy.init(client.user.id);
+      isReconnecting = true;
+      console.log('[Lavalink] Attempting to reconnect...');
 
-  client.user.setPresence({
-    activities: [{ name: `@${client.user.username} help`, type: ActivityType.Listening }],
-    status: 'online'
-  });
+      try {
+        // Destroy existing riffy instance if it exists
+        if (riffy) {
+          try { riffy.removeAllListeners(); } catch (_) {}
+        }
 
-  console.log(`${client.user.tag} is ready!`);
-});
+        riffy = new Riffy(client, lavalinkNodes, {
+          send: (payload) => {
+            const guild = client.guilds.cache.get(payload.d.guild_id);
+            if (guild) guild.shard.send(payload);
+          },
+          defaultSearchPlatform: 'ytmsearch',
+          restVersion: 'v4'
+        });
 
-// Raw event handler for voice state updates
-client.on('raw', (d) => {
-  if (riffy) riffy.updateVoiceState(d);
-});
+        attachRiffyEvents();
 
-// Riffy Events
-if (riffy) {
+        if (client.user) riffy.init(client.user.id);
+
+        console.log('[Lavalink] Reconnect attempt sent — waiting for nodeConnect event...');
+      } catch (error) {
+        console.error('[Lavalink] Reconnect attempt failed:', error.message);
+      }
+
+      isReconnecting = false;
+
+      // Schedule next attempt only if still disconnected
+      if (!lavalinkConnected) scheduleNext();
+    }, delay);
+  }
+
+  scheduleNext();
+}
+
+function stopLavalinkReconnect() {
+  if (lavalinkReconnectTimer) {
+    clearTimeout(lavalinkReconnectTimer);
+    lavalinkReconnectTimer = null;
+  }
+  isReconnecting = false;
+  console.log('[Lavalink] Auto-reconnect loop stopped.');
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Riffy Event Attachment (called on init + every reconnect)
+// ─────────────────────────────────────────────────────────────
+function attachRiffyEvents() {
+  if (!riffy) return;
+
   riffy.on('nodeConnect', (node) => {
     lavalinkConnected = true;
-    console.log(`Node ${node.name} connected`);
+    console.log(`[Lavalink] Node "${node.name}" connected ✅`);
+    stopLavalinkReconnect(); // Success — no more reconnect attempts
   });
 
   riffy.on('nodeError', (node, error) => {
-    lavalinkConnected = false;
-    console.log(`Node ${node.name} error: ${error.message}`);
+    console.log(`[Lavalink] Node "${node.name}" error: ${error.message}`);
+    if (lavalinkConnected) {
+      lavalinkConnected = false;
+      startLavalinkReconnect();
+    }
   });
 
   riffy.on('nodeDisconnect', (node) => {
-    lavalinkConnected = false;
-    console.log(`Node ${node.name} disconnected`);
+    console.log(`[Lavalink] Node "${node.name}" disconnected ❌`);
+    if (lavalinkConnected) {
+      lavalinkConnected = false;
+    }
+    startLavalinkReconnect();
   });
 
   riffy.on('trackStart', async (player, track) => {
@@ -191,7 +200,6 @@ if (riffy) {
       } catch (e) {}
     }
 
-    // Check for 24/7 mode
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
       return;
@@ -207,6 +215,110 @@ if (riffy) {
   });
 }
 
+// ─────────────────────────────────────────────────────────────
+//  Initial Riffy Initialization
+// ─────────────────────────────────────────────────────────────
+try {
+  riffy = new Riffy(client, lavalinkNodes, {
+    send: (payload) => {
+      const guild = client.guilds.cache.get(payload.d.guild_id);
+      if (guild) guild.shard.send(payload);
+    },
+    defaultSearchPlatform: 'ytmsearch',
+    restVersion: 'v4'
+  });
+  attachRiffyEvents();
+} catch (error) {
+  console.error('[Riffy] Failed to initialize:', error.message);
+  // Will retry via reconnect loop once bot is ready
+}
+
+const startTime = Date.now();
+
+// Player states for 24/7
+const playerStates = new Map();
+
+// ─────────────────────────────────────────────────────────────
+//  Express Server
+// ─────────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    bot: client.user?.tag || 'Not Ready',
+    uptime: formatUptime(Date.now() - startTime),
+    servers: client.guilds.cache.size,
+    users: client.users.cache.size,
+    lavalink: lavalinkConnected ? 'connected' : 'disconnected',
+    lavalinkReconnecting: !lavalinkConnected && lavalinkReconnectTimer !== null
+  });
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Date.now() - startTime });
+});
+
+app.listen(PORT, () => {
+  console.log(`Express server running on port ${PORT}`);
+});
+
+// ─────────────────────────────────────────────────────────────
+//  Command Aliases
+// ─────────────────────────────────────────────────────────────
+const commands = {
+  play: ['play', 'p'],
+  pause: ['pause'],
+  resume: ['resume', 'r'],
+  skip: ['skip', 's', 'next'],
+  stop: ['stop', 'disconnect', 'dc'],
+  queue: ['queue', 'q'],
+  nowplaying: ['nowplaying', 'np', 'current'],
+  join: ['join', 'connect'],
+  leave: ['leave'],
+  volume: ['volume', 'vol', 'v'],
+  loop: ['loop', 'repeat'],
+  shuffle: ['shuffle', 'sh'],
+  clearqueue: ['clearqueue', 'cq', 'clear'],
+  remove: ['remove', 'rm'],
+  move: ['move', 'mv'],
+  search: ['search', 'find'],
+  lyrics: ['lyrics', 'ly'],
+  '247': ['247', '24/7', 'stay'],
+  help: ['help', 'h', 'commands'],
+  ping: ['ping'],
+  uptime: ['uptime', 'ut'],
+  botinfo: ['botinfo', 'bi', 'info'],
+  stats: ['stats', 'statistics'],
+  support: ['support'],
+  invite: ['invite', 'inv'],
+  vote: ['vote'],
+  restart: ['restart']
+};
+
+// ─────────────────────────────────────────────────────────────
+//  Bot Ready
+// ─────────────────────────────────────────────────────────────
+client.once('ready', () => {
+  if (riffy) riffy.init(client.user.id);
+
+  client.user.setPresence({
+    activities: [{ name: `@${client.user.username} help`, type: ActivityType.Listening }],
+    status: 'online'
+  });
+
+  console.log(`${client.user.tag} is ready!`);
+
+  // If Lavalink failed on startup, begin reconnect loop immediately
+  if (!lavalinkConnected) {
+    console.log('[Lavalink] Not connected on startup — starting reconnect loop...');
+    startLavalinkReconnect();
+  }
+});
+
+// Raw event handler for voice state updates
+client.on('raw', (d) => {
+  if (riffy) riffy.updateVoiceState(d);
+});
+
 // Get command from aliases
 function getCommand(input) {
   for (const [cmd, aliases] of Object.entries(commands)) {
@@ -215,7 +327,9 @@ function getCommand(input) {
   return null;
 }
 
-// Message Handler
+// ─────────────────────────────────────────────────────────────
+//  Message Handler
+// ─────────────────────────────────────────────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
@@ -262,7 +376,7 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.error)
       .setTitle('❌ Lavalink Offline')
-      .setDescription('Music features are currently unavailable. Please try again later.');
+      .setDescription('Music features are currently unavailable. Attempting to reconnect automatically — please try again in a few minutes.');
     return message.reply({ embeds: [embed] });
   }
 
@@ -936,7 +1050,7 @@ client.on('messageCreate', async (message) => {
       .setTitle('🏓 Pong!')
       .addFields(
         { name: 'API Latency', value: `${Math.round(client.ws.ping)}ms`, inline: true },
-        { name: 'Lavalink', value: lavalinkConnected ? '✅ Connected' : '❌ Offline', inline: true }
+        { name: 'Lavalink', value: lavalinkConnected ? '✅ Connected' : '❌ Offline (reconnecting...)', inline: true }
       );
 
     message.reply({ embeds: [embed] });
@@ -985,7 +1099,7 @@ client.on('messageCreate', async (message) => {
         { name: 'Active Players', value: `${totalPlayers}`, inline: true },
         { name: 'Memory Usage', value: `${memUsage.toFixed(2)} MB`, inline: true },
         { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
-        { name: 'Lavalink', value: lavalinkConnected ? '✅ Online' : '❌ Offline', inline: true }
+        { name: 'Lavalink', value: lavalinkConnected ? '✅ Online' : `❌ Offline (reconnecting...)`, inline: true }
       );
 
     message.reply({ embeds: [embed] });
@@ -1023,7 +1137,9 @@ client.on('messageCreate', async (message) => {
   }
 });
 
-// Button Handler
+// ─────────────────────────────────────────────────────────────
+//  Button Handler
+// ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
@@ -1091,7 +1207,9 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Helper functions
+// ─────────────────────────────────────────────────────────────
+//  Helper Functions
+// ─────────────────────────────────────────────────────────────
 function formatTime(ms) {
   const seconds = Math.floor((ms / 1000) % 60);
   const minutes = Math.floor((ms / (1000 * 60)) % 60);
@@ -1118,7 +1236,9 @@ function formatUptime(ms) {
   return parts.join(' ') || '0s';
 }
 
-// Error handling
+// ─────────────────────────────────────────────────────────────
+//  Error Handling
+// ─────────────────────────────────────────────────────────────
 process.on('unhandledRejection', error => {
   console.error('Unhandled promise rejection:', error);
 });
