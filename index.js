@@ -45,9 +45,9 @@ let lavalinkConnected = false;
 try {
   riffy = new Riffy(client, [
     {
-      host: process.env.LAVALINK_HOST || 'api.hxstuadios.fun',
-      port: parseInt(process.env.LAVALINK_PORT) || 2001,
-      password: process.env.LAVALINK_PASSWORD || 'HXDevIsHere',
+      host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
+      port: parseInt(process.env.LAVALINK_PORT) || 13592,
+      password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
       secure: process.env.LAVALINK_SECURE === 'false'
     }
   ], {
@@ -62,14 +62,9 @@ try {
   console.error('Failed to initialize Riffy:', error.message);
 }
 
-// Helper to ensure Riffy is initialized safely if it's not a constructor issue but an internal one
-// In some cases, updating Node.js or the library is the only fix. 
-// Given the error is inside riffy structures, we should check if there's a specific version compatibility issue.
-
-
 const startTime = Date.now();
 
-// Player states for 24/7 and autoplay
+// Player states for 24/7
 const playerStates = new Map();
 
 // Express Server
@@ -105,14 +100,12 @@ const commands = {
   leave: ['leave'],
   volume: ['volume', 'vol', 'v'],
   loop: ['loop', 'repeat'],
-  autoplay: ['autoplay', 'ap'],
   shuffle: ['shuffle', 'sh'],
   clearqueue: ['clearqueue', 'cq', 'clear'],
   remove: ['remove', 'rm'],
   move: ['move', 'mv'],
   search: ['search', 'find'],
   lyrics: ['lyrics', 'ly'],
-  filters: ['filters', 'filter', 'fx'],
   '247': ['247', '24/7', 'stay'],
   help: ['help', 'h', 'commands'],
   ping: ['ping'],
@@ -123,32 +116,6 @@ const commands = {
   invite: ['invite', 'inv'],
   vote: ['vote'],
   restart: ['restart']
-};
-
-// Available filters
-const filters = {
-  '8d': { rotation: { rotationHz: 0.2 } },
-  'bassboost': { equalizer: [
-    { band: 0, gain: 0.2 },
-    { band: 1, gain: 0.15 },
-    { band: 2, gain: 0.1 },
-    { band: 3, gain: 0.05 }
-  ]},
-  'nightcore': { timescale: { speed: 1.3, pitch: 1.3, rate: 1 }, tremolo: { frequency: 2.0, depth: 0.5 } },
-  'vaporwave': { equalizer: [{ band: 1, gain: 0.3 }, { band: 0, gain: 0.3 }], timescale: { pitch: 0.5 }, tremolo: { frequency: 14.0, depth: 0.5 } },
-  'karaoke': { karaoke: { level: 1.0, monoLevel: 1.0, filterBand: 220.0, filterWidth: 100.0 } },
-  'soft': { lowPass: { smoothing: 20.0 } },
-  'treble': { equalizer: [{ band: 13, gain: 0.25 }, { band: 14, gain: 0.25 }] },
-  'pop': { equalizer: [
-    { band: 0, gain: 0.15 },
-    { band: 1, gain: 0.1 },
-    { band: 2, gain: 0.05 }
-  ]},
-  'party': { equalizer: [
-    { band: 0, gain: 0.1 },
-    { band: 1, gain: 0.15 }
-  ], timescale: { speed: 1.15, pitch: 1.0, rate: 1.0 } },
-  'vibrato': { vibrato: { frequency: 10.0, depth: 0.9 } }
 };
 
 client.once('ready', () => {
@@ -224,30 +191,6 @@ if (riffy) {
       } catch (e) {}
     }
 
-    // Autoplay logic
-    if (state?.autoplay) {
-      try {
-        const track = player.current;
-        if (!track) return;
-
-        const searchQuery = `${track.info.author} - ${track.info.title}`;
-        const search = await riffy.resolve({ query: searchQuery, requester: track.info.requester });
-
-        if (search && search.tracks && search.tracks.length > 0) {
-          const availableTracks = search.tracks.slice(0, 5).filter(t => t.info.identifier !== track.info.identifier);
-          if (availableTracks.length > 0) {
-            const nextTrack = availableTracks[Math.floor(Math.random() * availableTracks.length)];
-            player.queue.add(nextTrack);
-            if (!player.playing && !player.paused) player.play();
-            if (channel) channel.send(`🔄 **Autoplay:** Added **${nextTrack.info.title}**`);
-            return;
-          }
-        }
-      } catch (e) {
-        console.error('Autoplay error:', e);
-      }
-    }
-
     // Check for 24/7 mode
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
@@ -259,7 +202,6 @@ if (riffy) {
     playerStates.delete(player.guildId);
   });
 
-  // Removed old manual autoplay from trackEnd as riffy.autoplay() handles it in queueEnd
   riffy.on('trackEnd', async (player, track) => {
     // trackEnd logic if needed
   });
@@ -295,27 +237,27 @@ client.on('messageCreate', async (message) => {
 
   if (!command) return;
 
-    if (command === 'restart') {
-      if (message.author.id !== config.ownerId) {
-        const embed = new EmbedBuilder()
-          .setColor(config.color.error)
-          .setDescription('❌ This command is owner-only!');
-        return message.reply({ embeds: [embed] });
-      }
-
+  if (command === 'restart') {
+    if (message.author.id !== config.ownerId) {
       const embed = new EmbedBuilder()
-        .setColor(config.color.info)
-        .setDescription('🔄 Restarting bot...');
-
-      await message.reply({ embeds: [embed] });
-
-      console.log('Bot restart initiated by owner');
-      await client.destroy();
-      process.exit(0);
+        .setColor(config.color.error)
+        .setDescription('❌ This command is owner-only!');
+      return message.reply({ embeds: [embed] });
     }
 
+    const embed = new EmbedBuilder()
+      .setColor(config.color.info)
+      .setDescription('🔄 Restarting bot...');
+
+    await message.reply({ embeds: [embed] });
+
+    console.log('Bot restart initiated by owner');
+    await client.destroy();
+    process.exit(0);
+  }
+
   // Lavalink check for music commands
-  const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'loop', 'autoplay', 'shuffle', 'clearqueue', 'remove', 'move', 'search', 'lyrics', 'filters', 'join', 'leave'];
+  const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'loop', 'shuffle', 'clearqueue', 'remove', 'move', 'search', 'lyrics', 'join', 'leave'];
   if (musicCommands.includes(command) && !lavalinkConnected) {
     const embed = new EmbedBuilder()
       .setColor(config.color.error)
@@ -451,7 +393,7 @@ client.on('messageCreate', async (message) => {
 
       const msg = await message.reply({ embeds: [embed], components: [row] });
 
-    const collector = msg.createMessageComponentCollector({
+      const collector = msg.createMessageComponentCollector({
         componentType: ComponentType.StringSelect,
         time: 60000
       });
@@ -731,7 +673,6 @@ client.on('messageCreate', async (message) => {
     state.loop = nextMode;
     playerStates.set(message.guild.id, state);
 
-    // Set loop mode using Riffy's method
     if (nextMode === 'track') {
       player.setLoop('track');
     } else if (nextMode === 'queue') {
@@ -772,37 +713,6 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setDescription(`🎵 24/7 Mode: **${state.stay247 ? 'enabled' : 'disabled'}**`);
-    message.reply({ embeds: [embed] });
-  }
-
-  // AUTOPLAY Command
-  if (command === 'autoplay') {
-    const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Restriction: Only requester can toggle autoplay
-    if (message.author.id !== player.current.info.requester) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Only the song requester can toggle autoplay!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const state = playerStates.get(message.guild.id) || {};
-    state.autoplay = !state.autoplay;
-    playerStates.set(message.guild.id, state);
-
-    // Riffy autoplay toggle
-    player.isAutoplay = state.autoplay;
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`🔄 Autoplay: **${state.autoplay ? 'enabled' : 'disabled'}**\n*Note: Bot will automatically play related songs when queue ends*`);
     message.reply({ embeds: [embed] });
   }
 
@@ -955,100 +865,6 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // FILTERS Command
-  if (command === 'filters') {
-    const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    // Restriction: Only requester can use filters
-    if (message.author.id !== player.current.info.requester) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Only the song requester can use filters!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const filterOptions = Object.keys(filters).map(name => ({
-      label: name.charAt(0).toUpperCase() + name.slice(1),
-      description: `Apply ${name} filter`,
-      value: `filter_${name}`
-    }));
-
-    filterOptions.push({
-      label: 'Clear Filters',
-      description: 'Remove all active filters',
-      value: 'filter_clear'
-    });
-
-    const row = new ActionRowBuilder().addComponents(
-      new StringSelectMenuBuilder()
-        .setCustomId('filter_select')
-        .setPlaceholder('Select a filter to apply')
-        .addOptions(filterOptions)
-    );
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle('🎚️ Audio Filters')
-      .setDescription('**Available Filters:**\n' + Object.keys(filters).map(f => `• **${f}**`).join('\n'))
-      .addFields({
-        name: '⚠️ Important Note',
-        value: 'Filters are applied to the Lavalink server. Some filters may take a moment to activate or may not be supported by your Lavalink version.',
-        inline: false
-      })
-      .setFooter({ text: 'This menu will expire in 5 minutes' });
-
-    const msg = await message.reply({ embeds: [embed], components: [row] });
-
-    const collector = msg.createMessageComponentCollector({
-      componentType: ComponentType.StringSelect,
-      time: 300000
-    });
-
-    collector.on('collect', async (i) => {
-      if (i.user.id !== message.author.id) {
-        return i.reply({ content: '❌ This is not your filter menu!', flags: [MessageFlags.Ephemeral] });
-      }
-
-      const filterName = i.values[0].replace('filter_', '');
-
-      try {
-        if (filterName === 'clear') {
-          // Clear all filters
-          await player.node.rest.updatePlayer({
-            guildId: player.guildId,
-            data: { 
-              filters: {}
-            }
-          });
-          await i.reply({ content: '✅ Cleared all filters!', flags: [MessageFlags.Ephemeral] });
-        } else {
-          // Apply selected filter
-          const filterData = filters[filterName];
-          await player.node.rest.updatePlayer({
-            guildId: player.guildId,
-            data: { 
-              filters: filterData
-            }
-          });
-          await i.reply({ content: `✅ Applied **${filterName}** filter! The effect may take a moment to activate.`, flags: [MessageFlags.Ephemeral] });
-        }
-      } catch (error) {
-        console.error('Filter error:', error);
-        await i.reply({ content: `❌ Failed to apply filter: ${error.message || 'Unknown error'}`, flags: [MessageFlags.Ephemeral] });
-      }
-    });
-
-    collector.on('end', () => {
-      msg.edit({ components: [] }).catch(() => {});
-    });
-  }
-
   // HELP Command
   if (command === 'help') {
     const embed = new EmbedBuilder()
@@ -1067,7 +883,7 @@ client.on('messageCreate', async (message) => {
             '`queue (q)` • `clearqueue (cq)` • `shuffle (sh)` • `remove (rm)` • `move (mv)`',
             '',
             '**Modes:**',
-            '`loop` • `autoplay (ap)` • `247` • `filters (fx)`',
+            '`loop` • `247`',
             '',
             '**Other:**',
             '`nowplaying (np)` • `join` • `leave` • `volume (vol)` • `lyrics (ly)`'
