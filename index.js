@@ -44,8 +44,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMembers  // FIX: needed for accurate member counts
+    GatewayIntentBits.GuildVoiceStates
   ]
 });
 
@@ -55,10 +54,20 @@ let lavalinkReconnectTimer = null;
 let isReconnecting = false;
 
 // ─────────────────────────────────────────────────────────────
-//  Helper: check if a player is genuinely active
+//  Helper: disable and clear nowPlayingMessage
 // ─────────────────────────────────────────────────────────────
-function isPlayerActive(player) {
-  return player && player.current && (player.playing || player.paused);
+async function disableNowPlayingMessage(player) {
+  if (!player.nowPlayingMessage) return;
+  try {
+    const disabledRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
+      new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
+      new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
+    );
+    await player.nowPlayingMessage.edit({ components: [disabledRow] });
+  } catch (_) {}
+  // FIX: clear the reference so it can't be shown again after track ends
+  player.nowPlayingMessage = null;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -184,18 +193,8 @@ function attachRiffyEvents() {
       new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
     );
 
-    // FIX: disable buttons on previous now-playing message before sending a new one
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
+    // FIX: disable previous now-playing message before sending a new one
+    await disableNowPlayingMessage(player);
 
     const msg = await channel.send({ embeds: [embed], components: [row] });
     player.nowPlayingMessage = msg;
@@ -205,18 +204,8 @@ function attachRiffyEvents() {
     const channel = client.channels.cache.get(player.textChannel);
     const state = playerStates.get(player.guildId);
 
-    // FIX: disable buttons and clear nowPlayingMessage reference
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
+    // FIX: disable and clear the now playing message when queue ends
+    await disableNowPlayingMessage(player);
 
     if (state?.stay247) {
       if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
@@ -228,8 +217,10 @@ function attachRiffyEvents() {
     playerStates.delete(player.guildId);
   });
 
-  riffy.on('trackEnd', async (player, track) => {
-    // trackEnd logic if needed
+  riffy.on('trackEnd', async (player) => {
+    // FIX: clear nowPlayingMessage reference when track ends so stale data
+    // doesn't linger between tracks (trackStart will set a fresh one)
+    player.nowPlayingMessage = null;
   });
 }
 
@@ -257,14 +248,19 @@ const playerStates = new Map();
 // ─────────────────────────────────────────────────────────────
 //  Express Server
 // ─────────────────────────────────────────────────────────────
+
+// FIX: helper to get total user count without privileged intents
+function getTotalUsers() {
+  return client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
+}
+
 app.get('/', (req, res) => {
   res.json({
     status: 'online',
     bot: client.user?.tag || 'Not Ready',
     uptime: formatUptime(Date.now() - startTime),
     servers: client.guilds.cache.size,
-    // FIX: sum memberCount from all guilds for accurate user count
-    users: client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0),
+    users: getTotalUsers(),
     lavalink: lavalinkConnected ? 'connected' : 'disconnected',
     lavalinkReconnecting: !lavalinkConnected && lavalinkReconnectTimer !== null
   });
@@ -570,8 +566,7 @@ client.on('messageCreate', async (message) => {
   // PAUSE Command
   if (command === 'pause') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: use isPlayerActive helper
-    if (!isPlayerActive(player)) {
+    if (!player) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -588,8 +583,7 @@ client.on('messageCreate', async (message) => {
   // RESUME Command
   if (command === 'resume') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: use isPlayerActive helper
-    if (!isPlayerActive(player)) {
+    if (!player) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -606,8 +600,7 @@ client.on('messageCreate', async (message) => {
   // SKIP Command
   if (command === 'skip') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: use isPlayerActive helper
-    if (!isPlayerActive(player)) {
+    if (!player) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -617,20 +610,11 @@ client.on('messageCreate', async (message) => {
     }
 
     const skipped = player.current;
-    player.stop();
 
-    // FIX: disable buttons and clear reference immediately on skip
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
+    // FIX: disable and clear the now playing message before stopping
+    await disableNowPlayingMessage(player);
+
+    player.stop();
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
@@ -650,17 +634,8 @@ client.on('messageCreate', async (message) => {
       return message.reply({ embeds: [embed] });
     }
 
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
+    // FIX: disable and clear before destroying
+    await disableNowPlayingMessage(player);
 
     player.destroy();
     playerStates.delete(message.guild.id);
@@ -671,8 +646,9 @@ client.on('messageCreate', async (message) => {
   // QUEUE Command
   if (command === 'queue') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: gate on isPlayerActive so stale players don't show
-    if (!isPlayerActive(player)) {
+
+    // FIX: also check player.playing so stale player isn't shown after queue end
+    if (!player || !player.current || !player.playing) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -697,8 +673,9 @@ client.on('messageCreate', async (message) => {
   // NOW PLAYING Command
   if (command === 'nowplaying') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: gate on isPlayerActive to prevent stale "now playing" after skip/queue end
-    if (!isPlayerActive(player)) {
+
+    // FIX: check player.playing so we don't show a stale current track
+    if (!player || !player.current || !player.playing) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -707,8 +684,9 @@ client.on('messageCreate', async (message) => {
     const currentTime = player.position || 0;
     const totalTime = track.info.length;
 
-    // FIX: clamp progress to [0, 20] to prevent position 1 at track start
-    const progress = Math.min(20, Math.max(0, Math.floor((currentTime / totalTime) * 20)));
+    // FIX: clamp progress to [0, 20] so position never shows as 1 when at 0ms
+    const rawProgress = totalTime > 0 ? currentTime / totalTime : 0;
+    const progress = Math.min(20, Math.max(0, Math.floor(rawProgress * 20)));
     const progressBar = '▬'.repeat(progress) + '🔘' + '▬'.repeat(20 - progress);
 
     const embed = new EmbedBuilder()
@@ -762,6 +740,7 @@ client.on('messageCreate', async (message) => {
       return message.reply({ embeds: [embed] });
     }
 
+    await disableNowPlayingMessage(player);
     player.destroy();
     playerStates.delete(message.guild.id);
     const embed = new EmbedBuilder().setColor(config.color.info).setDescription('👋 Disconnected from voice channel!');
@@ -792,8 +771,7 @@ client.on('messageCreate', async (message) => {
   // LOOP Command
   if (command === 'loop') {
     const player = riffy.players.get(message.guild.id);
-    // FIX: use isPlayerActive helper
-    if (!isPlayerActive(player)) {
+    if (!player || !player.current) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -958,7 +936,7 @@ client.on('messageCreate', async (message) => {
     const player = riffy.players.get(message.guild.id);
     let searchQuery = args.slice(1).join(' ');
 
-    if (!searchQuery && isPlayerActive(player)) {
+    if (!searchQuery && player && player.current) {
       searchQuery = player.current.info.title;
     }
 
@@ -1027,13 +1005,21 @@ client.on('messageCreate', async (message) => {
           ].join('\n'),
           inline: false
         },
-        { name: '\u200b', value: '\u200b', inline: false },
+        {
+          name: '\u200b',
+          value: '\u200b',
+          inline: false
+        },
         {
           name: '🔧 Utility Commands',
           value: '`ping` • `uptime (ut)` • `botinfo (bi)` • `stats` • `support` • `invite (inv)` • `vote`',
           inline: false
         },
-        { name: '\u200b', value: '\u200b', inline: false },
+        {
+          name: '\u200b',
+          value: '\u200b',
+          inline: false
+        },
         {
           name: '💡 Command Info',
           value: '• Commands in parentheses **(p, r, s)** are shortcuts\n• Use `@mention command` to interact with the bot',
@@ -1084,9 +1070,6 @@ client.on('messageCreate', async (message) => {
 
   // BOTINFO Command
   if (command === 'botinfo') {
-    // FIX: sum guild memberCounts for accurate user total
-    const totalUsers = client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0);
-
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`ℹ️ ${client.user.username} Information`)
@@ -1094,7 +1077,8 @@ client.on('messageCreate', async (message) => {
       .addFields(
         { name: 'Bot Tag', value: client.user.tag, inline: true },
         { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        { name: 'Users', value: `${totalUsers}`, inline: true },
+        // FIX: use guild.memberCount sum — no privileged intent required
+        { name: 'Users', value: `${getTotalUsers()}`, inline: true },
         { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
         { name: 'Node.js', value: process.version, inline: true },
         { name: 'Library', value: 'discord.js', inline: true }
@@ -1106,21 +1090,15 @@ client.on('messageCreate', async (message) => {
   // STATS Command
   if (command === 'stats') {
     const memUsage = process.memoryUsage().heapUsed / 1024 / 1024;
-
-    // FIX: count only genuinely active players (playing or paused with a current track)
-    const totalPlayers = riffy
-      ? [...riffy.players.values()].filter(p => isPlayerActive(p)).length
-      : 0;
-
-    // FIX: sum guild memberCounts for accurate user total
-    const totalUsers = client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0);
+    const totalPlayers = riffy ? riffy.players.size : 0;
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`📊 ${client.user.username} Statistics`)
       .addFields(
         { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        { name: 'Users', value: `${totalUsers}`, inline: true },
+        // FIX: use guild.memberCount sum — no privileged intent required
+        { name: 'Users', value: `${getTotalUsers()}`, inline: true },
         { name: 'Active Players', value: `${totalPlayers}`, inline: true },
         { name: 'Memory Usage', value: `${memUsage.toFixed(2)} MB`, inline: true },
         { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
@@ -1169,8 +1147,7 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   const player = riffy?.players.get(interaction.guild.id);
-  // FIX: use isPlayerActive so stale players don't respond to buttons
-  if (!isPlayerActive(player)) {
+  if (!player) {
     return interaction.reply({ content: '❌ No music is playing!', flags: [MessageFlags.Ephemeral] });
   }
 
@@ -1207,21 +1184,9 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.user.id !== player.current.info.requester) {
       return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
     }
+    // FIX: disable and clear before stopping
+    await disableNowPlayingMessage(player);
     player.stop();
-
-    // FIX: clear nowPlayingMessage reference after skip via button
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
-
     await interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
   }
 
@@ -1229,20 +1194,8 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.user.id !== player.current.info.requester) {
       return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
     }
-
-    // FIX: clear nowPlayingMessage reference after stop via button
-    if (player.nowPlayingMessage) {
-      try {
-        const disabledRow = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-        );
-        await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (_) {}
-      player.nowPlayingMessage = null;
-    }
-
+    // FIX: disable and clear before destroying
+    await disableNowPlayingMessage(player);
     player.destroy();
     playerStates.delete(interaction.guild.id);
     await interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
