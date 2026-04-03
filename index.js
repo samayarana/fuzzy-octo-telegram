@@ -44,27 +44,32 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.GuildVoiceStates
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers  // FIX: needed for accurate member counts
   ]
 });
 
 let riffy;
 let lavalinkConnected = false;
-let lavalinkReconnectTimer = null;   // Holds the setInterval reference
-let isReconnecting = false;          // Prevents overlapping reconnect attempts
+let lavalinkReconnectTimer = null;
+let isReconnecting = false;
+
+// ─────────────────────────────────────────────────────────────
+//  Helper: check if a player is genuinely active
+// ─────────────────────────────────────────────────────────────
+function isPlayerActive(player) {
+  return player && player.current && (player.playing || player.paused);
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Lavalink Reconnect Logic
-//  • Runs every 2–3 minutes (random jitter to avoid thundering herd)
-//  • Stops automatically once Lavalink comes back online
 // ─────────────────────────────────────────────────────────────
 function getRandomInterval() {
-  // Random ms between 2 min (120 000) and 3 min (180 000)
   return Math.floor(Math.random() * 60_000) + 120_000;
 }
 
 function startLavalinkReconnect() {
-  if (lavalinkReconnectTimer) return; // Already running
+  if (lavalinkReconnectTimer) return;
 
   console.log('[Lavalink] Starting auto-reconnect loop (every 2–3 minutes)...');
 
@@ -90,7 +95,6 @@ function startLavalinkReconnect() {
       console.log('[Lavalink] Attempting to reconnect...');
 
       try {
-        // Destroy existing riffy instance if it exists
         if (riffy) {
           try { riffy.removeAllListeners(); } catch (_) {}
         }
@@ -115,7 +119,6 @@ function startLavalinkReconnect() {
 
       isReconnecting = false;
 
-      // Schedule next attempt only if still disconnected
       if (!lavalinkConnected) scheduleNext();
     }, delay);
   }
@@ -133,7 +136,7 @@ function stopLavalinkReconnect() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Riffy Event Attachment (called on init + every reconnect)
+//  Riffy Event Attachment
 // ─────────────────────────────────────────────────────────────
 function attachRiffyEvents() {
   if (!riffy) return;
@@ -141,7 +144,7 @@ function attachRiffyEvents() {
   riffy.on('nodeConnect', (node) => {
     lavalinkConnected = true;
     console.log(`[Lavalink] Node "${node.name}" connected ✅`);
-    stopLavalinkReconnect(); // Success — no more reconnect attempts
+    stopLavalinkReconnect();
   });
 
   riffy.on('nodeError', (node, error) => {
@@ -181,14 +184,7 @@ function attachRiffyEvents() {
       new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
     );
 
-    const msg = await channel.send({ embeds: [embed], components: [row] });
-    player.nowPlayingMessage = msg;
-  });
-
-  riffy.on('queueEnd', async (player) => {
-    const channel = client.channels.cache.get(player.textChannel);
-    const state = playerStates.get(player.guildId);
-
+    // FIX: disable buttons on previous now-playing message before sending a new one
     if (player.nowPlayingMessage) {
       try {
         const disabledRow = new ActionRowBuilder().addComponents(
@@ -197,7 +193,29 @@ function attachRiffyEvents() {
           new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
         );
         await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (e) {}
+      } catch (_) {}
+      player.nowPlayingMessage = null;
+    }
+
+    const msg = await channel.send({ embeds: [embed], components: [row] });
+    player.nowPlayingMessage = msg;
+  });
+
+  riffy.on('queueEnd', async (player) => {
+    const channel = client.channels.cache.get(player.textChannel);
+    const state = playerStates.get(player.guildId);
+
+    // FIX: disable buttons and clear nowPlayingMessage reference
+    if (player.nowPlayingMessage) {
+      try {
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
+        );
+        await player.nowPlayingMessage.edit({ components: [disabledRow] });
+      } catch (_) {}
+      player.nowPlayingMessage = null;
     }
 
     if (state?.stay247) {
@@ -230,12 +248,10 @@ try {
   attachRiffyEvents();
 } catch (error) {
   console.error('[Riffy] Failed to initialize:', error.message);
-  // Will retry via reconnect loop once bot is ready
 }
 
 const startTime = Date.now();
 
-// Player states for 24/7
 const playerStates = new Map();
 
 // ─────────────────────────────────────────────────────────────
@@ -247,7 +263,8 @@ app.get('/', (req, res) => {
     bot: client.user?.tag || 'Not Ready',
     uptime: formatUptime(Date.now() - startTime),
     servers: client.guilds.cache.size,
-    users: client.users.cache.size,
+    // FIX: sum memberCount from all guilds for accurate user count
+    users: client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0),
     lavalink: lavalinkConnected ? 'connected' : 'disconnected',
     lavalinkReconnecting: !lavalinkConnected && lavalinkReconnectTimer !== null
   });
@@ -307,19 +324,16 @@ client.once('ready', () => {
 
   console.log(`${client.user.tag} is ready!`);
 
-  // If Lavalink failed on startup, begin reconnect loop immediately
   if (!lavalinkConnected) {
     console.log('[Lavalink] Not connected on startup — starting reconnect loop...');
     startLavalinkReconnect();
   }
 });
 
-// Raw event handler for voice state updates
 client.on('raw', (d) => {
   if (riffy) riffy.updateVoiceState(d);
 });
 
-// Get command from aliases
 function getCommand(input) {
   for (const [cmd, aliases] of Object.entries(commands)) {
     if (aliases.includes(input)) return cmd;
@@ -333,7 +347,6 @@ function getCommand(input) {
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // Check for mention only
   if (message.content.trim() === `<@!${client.user.id}>` || message.content.trim() === `<@${client.user.id}>`) {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
@@ -370,7 +383,6 @@ client.on('messageCreate', async (message) => {
     process.exit(0);
   }
 
-  // Lavalink check for music commands
   const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'loop', 'shuffle', 'clearqueue', 'remove', 'move', 'search', 'lyrics', 'join', 'leave'];
   if (musicCommands.includes(command) && !lavalinkConnected) {
     const embed = new EmbedBuilder()
@@ -558,7 +570,8 @@ client.on('messageCreate', async (message) => {
   // PAUSE Command
   if (command === 'pause') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    // FIX: use isPlayerActive helper
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -575,7 +588,8 @@ client.on('messageCreate', async (message) => {
   // RESUME Command
   if (command === 'resume') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    // FIX: use isPlayerActive helper
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -592,7 +606,8 @@ client.on('messageCreate', async (message) => {
   // SKIP Command
   if (command === 'skip') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
+    // FIX: use isPlayerActive helper
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -604,6 +619,7 @@ client.on('messageCreate', async (message) => {
     const skipped = player.current;
     player.stop();
 
+    // FIX: disable buttons and clear reference immediately on skip
     if (player.nowPlayingMessage) {
       try {
         const disabledRow = new ActionRowBuilder().addComponents(
@@ -612,7 +628,8 @@ client.on('messageCreate', async (message) => {
           new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
         );
         await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (e) {}
+      } catch (_) {}
+      player.nowPlayingMessage = null;
     }
 
     const embed = new EmbedBuilder()
@@ -641,7 +658,8 @@ client.on('messageCreate', async (message) => {
           new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
         );
         await player.nowPlayingMessage.edit({ components: [disabledRow] });
-      } catch (e) {}
+      } catch (_) {}
+      player.nowPlayingMessage = null;
     }
 
     player.destroy();
@@ -653,7 +671,8 @@ client.on('messageCreate', async (message) => {
   // QUEUE Command
   if (command === 'queue') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
+    // FIX: gate on isPlayerActive so stale players don't show
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -666,7 +685,7 @@ client.on('messageCreate', async (message) => {
       .setColor(config.color.info)
       .setTitle('🎵 Music Queue')
       .setDescription(`**Now Playing:**\n[${current.info.title}](${current.info.uri}) - ${current.info.author}\n\n**Up Next:**\n${
-        queue.length > 0 
+        queue.length > 0
           ? queue.slice(0, 10).map((track, i) => `\`${i + 1}.\` [${track.info.title}](${track.info.uri}) - ${track.info.author}`).join('\n')
           : 'No tracks in queue'
       }${queue.length > 10 ? `\n\n*And ${queue.length - 10} more...*` : ''}`)
@@ -678,7 +697,8 @@ client.on('messageCreate', async (message) => {
   // NOW PLAYING Command
   if (command === 'nowplaying') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
+    // FIX: gate on isPlayerActive to prevent stale "now playing" after skip/queue end
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -686,7 +706,9 @@ client.on('messageCreate', async (message) => {
     const track = player.current;
     const currentTime = player.position || 0;
     const totalTime = track.info.length;
-    const progress = Math.floor((currentTime / totalTime) * 20);
+
+    // FIX: clamp progress to [0, 20] to prevent position 1 at track start
+    const progress = Math.min(20, Math.max(0, Math.floor((currentTime / totalTime) * 20)));
     const progressBar = '▬'.repeat(progress) + '🔘' + '▬'.repeat(20 - progress);
 
     const embed = new EmbedBuilder()
@@ -770,7 +792,8 @@ client.on('messageCreate', async (message) => {
   // LOOP Command
   if (command === 'loop') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
+    // FIX: use isPlayerActive helper
+    if (!isPlayerActive(player)) {
       const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
       return message.reply({ embeds: [embed] });
     }
@@ -796,10 +819,10 @@ client.on('messageCreate', async (message) => {
     }
 
     const modeEmoji = { off: '➡️', track: '🔂', queue: '🔁' };
-    const modeDesc = { 
-      off: 'Loop disabled', 
-      track: 'Looping current track', 
-      queue: 'Looping entire queue' 
+    const modeDesc = {
+      off: 'Loop disabled',
+      track: 'Looping current track',
+      queue: 'Looping entire queue'
     };
 
     const embed = new EmbedBuilder()
@@ -935,7 +958,7 @@ client.on('messageCreate', async (message) => {
     const player = riffy.players.get(message.guild.id);
     let searchQuery = args.slice(1).join(' ');
 
-    if (!searchQuery && player && player.current) {
+    if (!searchQuery && isPlayerActive(player)) {
       searchQuery = player.current.info.title;
     }
 
@@ -987,8 +1010,8 @@ client.on('messageCreate', async (message) => {
       .setDescription(`Mention me with a command! Example: \`@${client.user.username} play song name\`\n\u200b`)
       .setThumbnail(client.user.displayAvatarURL())
       .addFields(
-        { 
-          name: '🎵 Music Commands', 
+        {
+          name: '🎵 Music Commands',
           value: [
             '**Playback:**',
             '`play (p)` • `search (find)` • `pause` • `resume (r)` • `skip (s)` • `stop (dc)`',
@@ -1004,23 +1027,15 @@ client.on('messageCreate', async (message) => {
           ].join('\n'),
           inline: false
         },
-        { 
-          name: '\u200b',
-          value: '\u200b',
-          inline: false
-        },
-        { 
-          name: '🔧 Utility Commands', 
+        { name: '\u200b', value: '\u200b', inline: false },
+        {
+          name: '🔧 Utility Commands',
           value: '`ping` • `uptime (ut)` • `botinfo (bi)` • `stats` • `support` • `invite (inv)` • `vote`',
           inline: false
         },
-        { 
-          name: '\u200b',
-          value: '\u200b',
-          inline: false
-        },
-        { 
-          name: '💡 Command Info', 
+        { name: '\u200b', value: '\u200b', inline: false },
+        {
+          name: '💡 Command Info',
           value: '• Commands in parentheses **(p, r, s)** are shortcuts\n• Use `@mention command` to interact with the bot',
           inline: false
         }
@@ -1069,6 +1084,9 @@ client.on('messageCreate', async (message) => {
 
   // BOTINFO Command
   if (command === 'botinfo') {
+    // FIX: sum guild memberCounts for accurate user total
+    const totalUsers = client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0);
+
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`ℹ️ ${client.user.username} Information`)
@@ -1076,7 +1094,7 @@ client.on('messageCreate', async (message) => {
       .addFields(
         { name: 'Bot Tag', value: client.user.tag, inline: true },
         { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        { name: 'Users', value: `${client.users.cache.size}`, inline: true },
+        { name: 'Users', value: `${totalUsers}`, inline: true },
         { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
         { name: 'Node.js', value: process.version, inline: true },
         { name: 'Library', value: 'discord.js', inline: true }
@@ -1088,14 +1106,21 @@ client.on('messageCreate', async (message) => {
   // STATS Command
   if (command === 'stats') {
     const memUsage = process.memoryUsage().heapUsed / 1024 / 1024;
-    const totalPlayers = riffy ? riffy.players.size : 0;
+
+    // FIX: count only genuinely active players (playing or paused with a current track)
+    const totalPlayers = riffy
+      ? [...riffy.players.values()].filter(p => isPlayerActive(p)).length
+      : 0;
+
+    // FIX: sum guild memberCounts for accurate user total
+    const totalUsers = client.guilds.cache.reduce((acc, g) => acc + (g.memberCount || 0), 0);
 
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`📊 ${client.user.username} Statistics`)
       .addFields(
         { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        { name: 'Users', value: `${client.users.cache.size}`, inline: true },
+        { name: 'Users', value: `${totalUsers}`, inline: true },
         { name: 'Active Players', value: `${totalPlayers}`, inline: true },
         { name: 'Memory Usage', value: `${memUsage.toFixed(2)} MB`, inline: true },
         { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
@@ -1110,7 +1135,7 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle('💬 Support Server')
-      .setDescription(`[Click here to join](${config.supportServer})`)
+      .setDescription(`[Click here to join](${config.supportServer})`);
 
     message.reply({ embeds: [embed] });
   }
@@ -1121,7 +1146,7 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`📨 Invite ${client.user.username}!`)
-      .setDescription(`[Click here to invite](${invite})`)
+      .setDescription(`[Click here to invite](${invite})`);
 
     message.reply({ embeds: [embed] });
   }
@@ -1131,7 +1156,7 @@ client.on('messageCreate', async (message) => {
     const embed = new EmbedBuilder()
       .setColor(config.color.info)
       .setTitle(`🗳️ Vote for ${client.user.username}!`)
-      .setDescription(`[Vote on Top.gg](${config.voteLink})`)
+      .setDescription(`[Vote on Top.gg](${config.voteLink})`);
 
     message.reply({ embeds: [embed] });
   }
@@ -1144,7 +1169,8 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   const player = riffy?.players.get(interaction.guild.id);
-  if (!player) {
+  // FIX: use isPlayerActive so stale players don't respond to buttons
+  if (!isPlayerActive(player)) {
     return interaction.reply({ content: '❌ No music is playing!', flags: [MessageFlags.Ephemeral] });
   }
 
@@ -1182,12 +1208,20 @@ client.on('interactionCreate', async (interaction) => {
       return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
     }
     player.stop();
-    const disabledRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-    );
-    await interaction.message.edit({ components: [disabledRow] });
+
+    // FIX: clear nowPlayingMessage reference after skip via button
+    if (player.nowPlayingMessage) {
+      try {
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
+        );
+        await player.nowPlayingMessage.edit({ components: [disabledRow] });
+      } catch (_) {}
+      player.nowPlayingMessage = null;
+    }
+
     await interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
   }
 
@@ -1195,14 +1229,22 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.user.id !== player.current.info.requester) {
       return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
     }
+
+    // FIX: clear nowPlayingMessage reference after stop via button
+    if (player.nowPlayingMessage) {
+      try {
+        const disabledRow = new ActionRowBuilder().addComponents(
+          new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
+          new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
+        );
+        await player.nowPlayingMessage.edit({ components: [disabledRow] });
+      } catch (_) {}
+      player.nowPlayingMessage = null;
+    }
+
     player.destroy();
     playerStates.delete(interaction.guild.id);
-    const disabledRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-    );
-    await interaction.message.edit({ components: [disabledRow] });
     await interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
   }
 });
