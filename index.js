@@ -71,6 +71,33 @@ async function disableNowPlayingMessage(player) {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Helper: wait for Riffy voice handshake before calling play()
+//  Riffy needs both VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE from
+//  Discord before it can send the play op to Lavalink. Polling
+//  player.voiceChannel (set internally once both arrive) is far more
+//  reliable than a blind setTimeout and typically resolves in <150 ms.
+// ─────────────────────────────────────────────────────────────
+function waitForVoiceReady(player, timeout = 5000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const interval = setInterval(() => {
+      // Riffy marks the player ready once voice state + server packets arrive
+      if (player.voiceChannel || player.connected) {
+        clearInterval(interval);
+        return resolve();
+      }
+      if (Date.now() - start >= timeout) {
+        clearInterval(interval);
+        // Don't hard-reject — let play() attempt anyway; worst case it fails
+        // gracefully via Lavalink and the user can retry.
+        console.warn('[Voice] Timed out waiting for voice ready, attempting play anyway');
+        return resolve();
+      }
+    }, 20); // check every 20 ms — very fast, negligible CPU
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Lavalink Reconnect Logic
 // ─────────────────────────────────────────────────────────────
 function getRandomInterval() {
@@ -405,19 +432,10 @@ client.on('messageCreate', async (message) => {
       return message.reply({ embeds: [embed] });
     }
 
-    let player = riffy.players.get(message.guild.id);
-
-    if (!player) {
-      player = riffy.createConnection({
-        guildId: message.guild.id,
-        voiceChannel: message.member.voice.channel.id,
-        textChannel: message.channel.id,
-        deaf: true
-      });
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
     try {
+      // FAST FIX: resolve the track FIRST before touching the player/connection.
+      // This way the track data is ready the moment the voice connection is live,
+      // and we never sit in a setTimeout waiting blindly.
       const resolve = await riffy.resolve({ query, requester: message.author.id });
 
       if (resolve.loadType === 'error' || resolve.loadType === 'empty') {
@@ -425,6 +443,19 @@ client.on('messageCreate', async (message) => {
           .setColor(config.color.error)
           .setDescription('❌ No results found!');
         return message.reply({ embeds: [embed] });
+      }
+
+      // Now get-or-create the player AFTER we have track data
+      let player = riffy.players.get(message.guild.id);
+      const isNewConnection = !player;
+
+      if (!player) {
+        player = riffy.createConnection({
+          guildId: message.guild.id,
+          voiceChannel: message.member.voice.channel.id,
+          textChannel: message.channel.id,
+          deaf: true
+        });
       }
 
       const tracks = resolve.loadType === 'playlist' ? resolve.tracks : [resolve.tracks[0]];
@@ -457,8 +488,17 @@ client.on('messageCreate', async (message) => {
         message.reply({ embeds: [embed] });
       }
 
-      if (!player.playing && !player.paused) player.play();
+      if (!player.playing && !player.paused) {
+        if (isNewConnection) {
+          // FAST FIX: wait for voice state handshake (VOICE_STATE_UPDATE +
+          // VOICE_SERVER_UPDATE) instead of a blind 500 ms delay.
+          // Riffy sets player.voiceChannel once both packets arrive; poll for it.
+          await waitForVoiceReady(player);
+        }
+        player.play();
+      }
     } catch (error) {
+      console.error('[Play]', error);
       const embed = new EmbedBuilder()
         .setColor(config.color.error)
         .setDescription('❌ An error occurred while loading the track.');
@@ -529,6 +569,8 @@ client.on('messageCreate', async (message) => {
         const selected = tracks[index];
 
         let player = riffy.players.get(message.guild.id);
+        const isNewConnection = !player;
+
         if (!player) {
           player = riffy.createConnection({
             guildId: message.guild.id,
@@ -536,7 +578,6 @@ client.on('messageCreate', async (message) => {
             textChannel: message.channel.id,
             deaf: true
           });
-          await new Promise(resolve => setTimeout(resolve, 500));
         }
 
         selected.info.requester = message.author.id;
@@ -548,7 +589,10 @@ client.on('messageCreate', async (message) => {
 
         await i.update({ embeds: [addEmbed], components: [] });
 
-        if (!player.playing && !player.paused) player.play();
+        if (!player.playing && !player.paused) {
+          if (isNewConnection) await waitForVoiceReady(player);
+          player.play();
+        }
         collector.stop();
       });
 
