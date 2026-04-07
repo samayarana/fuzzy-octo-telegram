@@ -39,7 +39,7 @@ const lavalinkNodes = [{
   host:     process.env.LAVALINK_HOST     || 'lavalink.jirayu.net',
   port:     parseInt(process.env.LAVALINK_PORT) || 13592,
   password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-  secure:   process.env.LAVALINK_SECURE === 'true'
+  secure:   process.env.LAVALINK_SECURE === 'false'
 }];
 
 const client = new Client({
