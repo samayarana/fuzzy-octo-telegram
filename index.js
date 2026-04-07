@@ -263,6 +263,45 @@ function stopLavalinkReconnect() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  VERIFY THEN RECONNECT
+//
+//  Called from nodeError / nodeDisconnect.  Riffy can fire these
+//  events for transient glitches that it auto-heals within seconds.
+//  We wait 15 s, then probe the node via HTTP.  Only if it is truly
+//  unreachable do we tear down Riffy and start the reconnect loop.
+// ═══════════════════════════════════════════════════════════════
+let verifyTimer = null;
+function verifyAndReconnect(node, reason) {
+  if (verifyTimer) return; // already scheduled
+  console.warn(`[Lavalink] Will verify node in 15 s (reason: ${reason})`);
+  verifyTimer = setTimeout(async () => {
+    verifyTimer = null;
+    if (lavalinkConnected) {
+      console.log('[Lavalink] Node recovered on its own — no action needed.');
+      return;
+    }
+    const n     = lavalinkNodes[0];
+    const proto = n.secure ? 'https' : 'http';
+    try {
+      const res = await fetch(`${proto}://${n.host}:${n.port}/version`, {
+        headers: { Authorization: n.password },
+        signal:  AbortSignal.timeout(8000)
+      });
+      if (res.ok) {
+        console.log('[Lavalink] Node is reachable — skipping reconnect loop.');
+        return;
+      }
+      throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.warn(`[Lavalink] Node confirmed offline (${err.message}) — starting reconnect.`);
+      lavalinkConnected = false;
+      stopHeartbeat();
+      startLavalinkReconnect();
+    }
+  }, 15_000);
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  RIFFY EVENTS
 // ═══════════════════════════════════════════════════════════════
 function attachRiffyEvents() {
@@ -273,20 +312,21 @@ function attachRiffyEvents() {
     console.log(`[Lavalink] "${node.name}" connected ✅`);
     stopLavalinkReconnect();
     startHeartbeat();
+    // Cancel any pending offline-verification timer — node is back
+    if (verifyTimer) { clearTimeout(verifyTimer); verifyTimer = null; }
   });
 
   riffy.on('nodeError', (node, error) => {
     console.error(`[Lavalink] "${node.name}" error: ${error.message}`);
-    lavalinkConnected = false;
-    stopHeartbeat();
-    startLavalinkReconnect();
+    // Verify the node is truly unreachable before triggering a full reconnect
+    verifyAndReconnect(node, `nodeError: ${error.message}`);
   });
 
   riffy.on('nodeDisconnect', (node) => {
     console.warn(`[Lavalink] "${node.name}" disconnected ❌`);
-    lavalinkConnected = false;
-    stopHeartbeat();
-    startLavalinkReconnect();
+    // Give Riffy's own reconnect a 15 s window first; only force-reconnect if
+    // an HTTP probe confirms the node is genuinely offline.
+    verifyAndReconnect(node, 'nodeDisconnect');
   });
 
   riffy.on('trackStart', async (player, track) => {
@@ -436,7 +476,13 @@ client.once('clientReady', () => {
   if (!lavalinkConnected) startLavalinkReconnect();
 });
 
-client.on('raw', (d) => { if (riffy) riffy.updateVoiceState(d); });
+client.on('raw', (d) => {
+  // Skip VOICE_SERVER_UPDATE packets that have no endpoint — Discord sends
+  // these during voice-region switches / bot moves. Passing them to Riffy
+  // causes an unhandled "Missing 'endpoint' property" crash.
+  if (d.t === 'VOICE_SERVER_UPDATE' && !d.d?.endpoint) return;
+  if (riffy) riffy.updateVoiceState(d);
+});
 
 // ═══════════════════════════════════════════════════════════════
 //  MESSAGE HANDLER
@@ -910,12 +956,20 @@ client.on('messageCreate', async (message) => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
+  // Defer immediately so duplicate presses / slow async work never cause
+  // "Interaction has already been acknowledged" (error 40060).
+  try {
+    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+  } catch {
+    return; // interaction already handled (e.g. double-click), bail out
+  }
+
   const player = riffy?.players.get(interaction.guild.id);
-  if (!player)                        return interaction.reply({ content: '❌ No music is playing!',             flags: [MessageFlags.Ephemeral] });
-  if (!interaction.member.voice.channel) return interaction.reply({ content: '❌ Join a voice channel!',          flags: [MessageFlags.Ephemeral] });
-  if (!player.current)                return interaction.reply({ content: '❌ No track loaded!',                  flags: [MessageFlags.Ephemeral] });
+  if (!player)                           return interaction.editReply({ content: '❌ No music is playing!' });
+  if (!interaction.member.voice.channel) return interaction.editReply({ content: '❌ Join a voice channel!' });
+  if (!player.current)                   return interaction.editReply({ content: '❌ No track loaded!' });
   if (interaction.user.id !== player.current.info.requester) {
-    return interaction.reply({ content: '❌ Only the requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
+    return interaction.editReply({ content: '❌ Only the requester can use these buttons!' });
   }
 
   if (interaction.customId === 'pause') {
@@ -925,30 +979,30 @@ client.on('interactionCreate', async (interaction) => {
         new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
-      )] });
-      return interaction.reply({ content: '▶️ Resumed!', flags: [MessageFlags.Ephemeral] });
+      )] }).catch(() => {});
+      return interaction.editReply({ content: '▶️ Resumed!' });
     } else {
       player.pause(true);
       await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('pause').setEmoji('▶️').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
-      )] });
-      return interaction.reply({ content: '⏸️ Paused!', flags: [MessageFlags.Ephemeral] });
+      )] }).catch(() => {});
+      return interaction.editReply({ content: '⏸️ Paused!' });
     }
   }
 
   if (interaction.customId === 'skip') {
     await disableNowPlayingMessage(player);
     player.stop();
-    return interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
+    return interaction.editReply({ content: '⏭️ Skipped!' });
   }
 
   if (interaction.customId === 'stop') {
     await disableNowPlayingMessage(player);
     player.destroy();
     playerStates.delete(interaction.guild.id);
-    return interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
+    return interaction.editReply({ content: '⏹️ Stopped!' });
   }
 });
 
