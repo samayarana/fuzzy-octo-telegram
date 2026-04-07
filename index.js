@@ -36,10 +36,10 @@ const config = {
 };
 
 const lavalinkNodes = [{
-  host:     process.env.LAVALINK_HOST     || 'lavalink-v4.triniumhost.com',
-  port:     parseInt(process.env.LAVALINK_PORT) || 443,
-  password: process.env.LAVALINK_PASSWORD || 'free',
-  secure:   process.env.LAVALINK_SECURE === 'true'
+  host:     process.env.LAVALINK_HOST     || 'lavalink.jirayu.net',
+  port:     parseInt(process.env.LAVALINK_PORT) || 13592,
+  password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+  secure:   process.env.LAVALINK_SECURE === 'false'
 }];
 
 const client = new Client({
