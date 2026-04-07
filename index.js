@@ -1,44 +1,46 @@
 // Patch for Riffy Node initialization error in Node.js 20+
 const originalDefineProperty = Object.defineProperty;
-Object.defineProperty = function(obj, prop, descriptor) {
-  if (descriptor && (descriptor.get || descriptor.set) && (Object.prototype.hasOwnProperty.call(descriptor, 'value') || Object.prototype.hasOwnProperty.call(descriptor, 'writable'))) {
-    const newDescriptor = { ...descriptor };
-    delete newDescriptor.value;
-    delete newDescriptor.writable;
-    return originalDefineProperty(obj, prop, newDescriptor);
+Object.defineProperty = function (obj, prop, descriptor) {
+  if (
+    descriptor &&
+    (descriptor.get || descriptor.set) &&
+    (Object.prototype.hasOwnProperty.call(descriptor, 'value') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'writable'))
+  ) {
+    const d = { ...descriptor };
+    delete d.value;
+    delete d.writable;
+    return originalDefineProperty(obj, prop, d);
   }
   return originalDefineProperty(obj, prop, descriptor);
 };
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder, ActivityType, StringSelectMenuBuilder, ComponentType, MessageFlags } = require('discord.js');
+const {
+  Client, GatewayIntentBits,
+  ActionRowBuilder, ButtonBuilder, ButtonStyle,
+  EmbedBuilder, ActivityType,
+  StringSelectMenuBuilder, ComponentType, MessageFlags
+} = require('discord.js');
 const { Riffy } = require('riffy');
 const express = require('express');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// Configuration
 const config = {
-  ownerId: process.env.OWNER_ID || '1092773378101882951',
+  ownerId:       process.env.OWNER_ID       || '1092773378101882951',
   supportServer: process.env.SUPPORT_SERVER || 'https://discord.gg/su57JWf2V5',
-  voteLink: process.env.VOTE_LINK || 'https://top.gg/bot/1450084513513341050/vote',
-  color: {
-    success: '#00ff00',
-    info: '#0099ff',
-    error: '#ff0000'
-  }
+  voteLink:      process.env.VOTE_LINK      || 'https://top.gg/bot/1450084513513341050/vote',
+  color: { success: '#00ff00', info: '#0099ff', error: '#ff0000' }
 };
 
-// Lavalink node configuration (extracted for reuse during reconnect)
-const lavalinkNodes = [
-  {
-    host: process.env.LAVALINK_HOST || 'lavalink.jirayu.net',
-    port: parseInt(process.env.LAVALINK_PORT) || 13592,
-    password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-    secure: process.env.LAVALINK_SECURE === 'false'
-  }
-];
+const lavalinkNodes = [{
+  host:     process.env.LAVALINK_HOST     || 'lavalink.jirayu.net',
+  port:     parseInt(process.env.LAVALINK_PORT) || 13592,
+  password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
+  secure:   process.env.LAVALINK_SECURE === 'true'
+}];
 
 const client = new Client({
   intents: [
@@ -49,92 +51,190 @@ const client = new Client({
 });
 
 let riffy;
-let lavalinkConnected = false;
+let lavalinkConnected      = false;
 let lavalinkReconnectTimer = null;
-let isReconnecting = false;
+let isReconnecting         = false;
+let heartbeatTimer         = null;
 
-// ─────────────────────────────────────────────────────────────
-//  Helper: disable and clear nowPlayingMessage
-// ─────────────────────────────────────────────────────────────
-async function disableNowPlayingMessage(player) {
-  if (!player.nowPlayingMessage) return;
-  try {
-    const disabledRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
-      new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
-    );
-    await player.nowPlayingMessage.edit({ components: [disabledRow] });
-  } catch (_) {}
-  // FIX: clear the reference so it can't be shown again after track ends
-  player.nowPlayingMessage = null;
+const playerStates = new Map();
+const startTime    = Date.now();
+
+// ═══════════════════════════════════════════════════════════════
+//  NODE HEARTBEAT
+//
+//  WHY: Public Lavalink nodes (e.g. jirayu.net) keep the WebSocket
+//  open for days but silently stop processing play ops after ~48 h
+//  when their internal session expires. Riffy never fires
+//  nodeError/nodeDisconnect, so lavalinkConnected stays true while
+//  nothing actually plays — joins VC, sends embed, no audio.
+//
+//  FIX: Every 3 minutes, HTTP-ping /version on the node.
+//  If it fails → force-reset everything and restart reconnect loop.
+// ═══════════════════════════════════════════════════════════════
+function startHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(async () => {
+    if (!lavalinkConnected) return;
+    try {
+      const n     = lavalinkNodes[0];
+      const proto = n.secure ? 'https' : 'http';
+      const res   = await fetch(`${proto}://${n.host}:${n.port}/version`, {
+        headers: { Authorization: n.password },
+        signal:  AbortSignal.timeout(8000)
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // Node alive — nothing to do
+    } catch (err) {
+      console.warn(`[Heartbeat] Node failed: ${err.message} → forcing reconnect`);
+      lavalinkConnected = false;
+      // Tear down every active player so guilds aren't permanently stuck
+      if (riffy) {
+        for (const [, player] of riffy.players) {
+          try {
+            const ch = client.channels.cache.get(player.textChannel);
+            ch?.send('⚠️ Music connection lost. Please use `play` again in ~30 seconds.').catch(() => {});
+            await disableNowPlayingMessage(player);
+            player.destroy();
+          } catch (_) {}
+        }
+      }
+      stopHeartbeat();
+      startLavalinkReconnect();
+    }
+  }, 3 * 60 * 1000);
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Helper: wait for Riffy voice handshake before calling play()
-//  Riffy needs both VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE from
-//  Discord before it can send the play op to Lavalink. Polling
-//  player.voiceChannel (set internally once both arrive) is far more
-//  reliable than a blind setTimeout and typically resolves in <150 ms.
-// ─────────────────────────────────────────────────────────────
-function waitForVoiceReady(player, timeout = 5000) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const interval = setInterval(() => {
-      // Riffy marks the player ready once voice state + server packets arrive
-      if (player.voiceChannel || player.connected) {
-        clearInterval(interval);
-        return resolve();
-      }
-      if (Date.now() - start >= timeout) {
-        clearInterval(interval);
-        // Don't hard-reject — let play() attempt anyway; worst case it fails
-        // gracefully via Lavalink and the user can retry.
-        console.warn('[Voice] Timed out waiting for voice ready, attempting play anyway');
-        return resolve();
-      }
-    }, 20); // check every 20 ms — very fast, negligible CPU
+function stopHeartbeat() {
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SAFE PLAY
+//
+//  WHY: Even when the node looks connected, it can silently drop
+//  play ops (stale session). trackStart never fires, the bot sits
+//  in VC doing nothing, and the player is permanently broken for
+//  that guild — even across bot restarts (because the player object
+//  persists in Riffy's map).
+//
+//  FIX: After calling player.play(), wait up to 8 s for trackStart.
+//  If it never arrives → node is broken → destroy the player,
+//  notify the channel, and restart reconnect.
+// ═══════════════════════════════════════════════════════════════
+function safePlay(player, textChannelId) {
+  return new Promise((resolve) => {
+    let settled = false;
+
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      riffy.removeListener('trackStart', onTrackStart);
+      resolve(ok);
+    };
+
+    const onTrackStart = () => finish(true);
+    riffy.once('trackStart', onTrackStart);
+
+    const timer = setTimeout(async () => {
+      if (settled) return;
+      console.warn(`[safePlay] trackStart never fired in guild ${player.guildId} — node is stale`);
+
+      const ch = client.channels.cache.get(textChannelId || player.textChannel);
+      ch?.send('⚠️ Playback failed to start (Lavalink node issue). Reconnecting — please try `play` again in ~30 seconds.').catch(() => {});
+
+      lavalinkConnected = false;
+      stopHeartbeat();
+      await disableNowPlayingMessage(player);
+      try { player.destroy(); } catch (_) {}
+      startLavalinkReconnect();
+      finish(false);
+    }, 8000);
+
+    player.play();
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Lavalink Reconnect Logic
-// ─────────────────────────────────────────────────────────────
-function getRandomInterval() {
-  return Math.floor(Math.random() * 60_000) + 120_000;
+// ═══════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════
+
+async function disableNowPlayingMessage(player) {
+  if (!player.nowPlayingMessage) return;
+  try {
+    await player.nowPlayingMessage.edit({
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger).setDisabled(true)
+      )]
+    });
+  } catch (_) {}
+  player.nowPlayingMessage = null;
 }
+
+// Poll for Riffy's internal voice handshake — no blind setTimeout
+function waitForVoiceReady(player, timeout = 6000) {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (player.voiceChannel || player.connected) { clearInterval(iv); return resolve(); }
+      if (Date.now() - start >= timeout) {
+        clearInterval(iv);
+        console.warn('[Voice] Timed out waiting for voice ready — attempting play anyway');
+        resolve();
+      }
+    }, 20);
+  });
+}
+
+function getTotalUsers() {
+  return client.guilds.cache.reduce((a, g) => a + g.memberCount, 0);
+}
+
+function formatTime(ms) {
+  const s = Math.floor((ms / 1000) % 60);
+  const m = Math.floor((ms / 60000) % 60);
+  const h = Math.floor(ms / 3600000);
+  return h > 0
+    ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+    : `${m}:${String(s).padStart(2,'0')}`;
+}
+
+function formatUptime(ms) {
+  const s = Math.floor((ms / 1000) % 60);
+  const m = Math.floor((ms / 60000) % 60);
+  const h = Math.floor((ms / 3600000) % 24);
+  const d = Math.floor(ms / 86400000);
+  const p = [];
+  if (d) p.push(`${d}d`);
+  if (h) p.push(`${h}h`);
+  if (m) p.push(`${m}m`);
+  if (s) p.push(`${s}s`);
+  return p.join(' ') || '0s';
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  LAVALINK RECONNECT LOOP
+// ═══════════════════════════════════════════════════════════════
+function getRandomInterval() { return Math.floor(Math.random() * 60_000) + 120_000; }
 
 function startLavalinkReconnect() {
   if (lavalinkReconnectTimer) return;
-
-  console.log('[Lavalink] Starting auto-reconnect loop (every 2–3 minutes)...');
+  console.log('[Lavalink] Starting reconnect loop (2–3 min interval)...');
 
   function scheduleNext() {
     const delay = getRandomInterval();
-    console.log(`[Lavalink] Next reconnect attempt in ${Math.round(delay / 1000)}s`);
-
+    console.log(`[Lavalink] Next attempt in ${Math.round(delay / 1000)}s`);
     lavalinkReconnectTimer = setTimeout(async () => {
       lavalinkReconnectTimer = null;
-
-      if (lavalinkConnected) {
-        console.log('[Lavalink] Already connected — stopping reconnect loop.');
-        isReconnecting = false;
-        return;
-      }
-
-      if (isReconnecting) {
-        scheduleNext();
-        return;
-      }
+      if (lavalinkConnected) { isReconnecting = false; return; }
+      if (isReconnecting)    { scheduleNext(); return; }
 
       isReconnecting = true;
-      console.log('[Lavalink] Attempting to reconnect...');
-
+      console.log('[Lavalink] Reconnecting...');
       try {
-        if (riffy) {
-          try { riffy.removeAllListeners(); } catch (_) {}
-        }
-
+        if (riffy) { try { riffy.removeAllListeners(); } catch (_) {} }
         riffy = new Riffy(client, lavalinkNodes, {
           send: (payload) => {
             const guild = client.guilds.cache.get(payload.d.guild_id);
@@ -143,18 +243,12 @@ function startLavalinkReconnect() {
           defaultSearchPlatform: 'ytmsearch',
           restVersion: 'v4'
         });
-
         attachRiffyEvents();
-
         if (client.user) riffy.init(client.user.id);
-
-        console.log('[Lavalink] Reconnect attempt sent — waiting for nodeConnect event...');
-      } catch (error) {
-        console.error('[Lavalink] Reconnect attempt failed:', error.message);
+      } catch (err) {
+        console.error('[Lavalink] Reconnect error:', err.message);
       }
-
       isReconnecting = false;
-
       if (!lavalinkConnected) scheduleNext();
     }, delay);
   }
@@ -163,39 +257,35 @@ function startLavalinkReconnect() {
 }
 
 function stopLavalinkReconnect() {
-  if (lavalinkReconnectTimer) {
-    clearTimeout(lavalinkReconnectTimer);
-    lavalinkReconnectTimer = null;
-  }
+  if (lavalinkReconnectTimer) { clearTimeout(lavalinkReconnectTimer); lavalinkReconnectTimer = null; }
   isReconnecting = false;
-  console.log('[Lavalink] Auto-reconnect loop stopped.');
+  console.log('[Lavalink] Reconnect loop stopped.');
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Riffy Event Attachment
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  RIFFY EVENTS
+// ═══════════════════════════════════════════════════════════════
 function attachRiffyEvents() {
   if (!riffy) return;
 
   riffy.on('nodeConnect', (node) => {
     lavalinkConnected = true;
-    console.log(`[Lavalink] Node "${node.name}" connected ✅`);
+    console.log(`[Lavalink] "${node.name}" connected ✅`);
     stopLavalinkReconnect();
+    startHeartbeat();
   });
 
   riffy.on('nodeError', (node, error) => {
-    console.log(`[Lavalink] Node "${node.name}" error: ${error.message}`);
-    if (lavalinkConnected) {
-      lavalinkConnected = false;
-      startLavalinkReconnect();
-    }
+    console.error(`[Lavalink] "${node.name}" error: ${error.message}`);
+    lavalinkConnected = false;
+    stopHeartbeat();
+    startLavalinkReconnect();
   });
 
   riffy.on('nodeDisconnect', (node) => {
-    console.log(`[Lavalink] Node "${node.name}" disconnected ❌`);
-    if (lavalinkConnected) {
-      lavalinkConnected = false;
-    }
+    console.warn(`[Lavalink] "${node.name}" disconnected ❌`);
+    lavalinkConnected = false;
+    stopHeartbeat();
     startLavalinkReconnect();
   });
 
@@ -203,57 +293,67 @@ function attachRiffyEvents() {
     const channel = client.channels.cache.get(player.textChannel);
     if (!channel) return;
 
-    const embed = new EmbedBuilder()
-      .setColor(config.color.success)
-      .setTitle('🎵 Now Playing')
-      .setDescription(`[${track.info.title}](${track.info.uri})`)
-      .setThumbnail(track.info.thumbnail || track.info.artworkUrl || null)
-      .addFields(
-        { name: 'Artist', value: track.info.author || 'Unknown', inline: true },
-        { name: 'Duration', value: formatTime(track.info.length), inline: true },
-        { name: 'Requested by', value: `<@${track.info.requester}>`, inline: true }
-      );
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
-    );
-
-    // FIX: disable previous now-playing message before sending a new one
     await disableNowPlayingMessage(player);
 
-    const msg = await channel.send({ embeds: [embed], components: [row] });
+    const msg = await channel.send({
+      embeds: [new EmbedBuilder()
+        .setColor(config.color.success)
+        .setTitle('🎵 Now Playing')
+        .setDescription(`[${track.info.title}](${track.info.uri})`)
+        .setThumbnail(track.info.thumbnail || track.info.artworkUrl || null)
+        .addFields(
+          { name: 'Artist',       value: track.info.author || 'Unknown', inline: true },
+          { name: 'Duration',     value: formatTime(track.info.length),   inline: true },
+          { name: 'Requested by', value: `<@${track.info.requester}>`,    inline: true }
+        )],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
+      )]
+    });
     player.nowPlayingMessage = msg;
+  });
+
+  riffy.on('trackEnd', (player) => {
+    player.nowPlayingMessage = null;
   });
 
   riffy.on('queueEnd', async (player) => {
     const channel = client.channels.cache.get(player.textChannel);
-    const state = playerStates.get(player.guildId);
-
-    // FIX: disable and clear the now playing message when queue ends
+    const state   = playerStates.get(player.guildId);
     await disableNowPlayingMessage(player);
-
     if (state?.stay247) {
-      if (channel) channel.send('Queue ended. Staying in voice channel (24/7 mode enabled).');
+      channel?.send('Queue ended. Staying in VC (24/7 mode on).').catch(() => {});
       return;
     }
-
-    if (channel) channel.send('Queue ended. Leaving voice channel.');
+    channel?.send('Queue ended. Leaving voice channel.').catch(() => {});
     player.destroy();
     playerStates.delete(player.guildId);
   });
 
-  riffy.on('trackEnd', async (player) => {
-    // FIX: clear nowPlayingMessage reference when track ends so stale data
-    // doesn't linger between tracks (trackStart will set a fresh one)
-    player.nowPlayingMessage = null;
+  // Lavalink rejected the track (region-locked, bad URL, etc.)
+  riffy.on('trackError', async (player, track, payload) => {
+    console.error(`[trackError] ${player.guildId} | ${track?.info?.title} | ${payload?.exception?.message}`);
+    const channel = client.channels.cache.get(player.textChannel);
+    channel?.send(`❌ Error on **${track?.info?.title || 'track'}**: ${payload?.exception?.message || 'Unknown error'}. Skipping...`).catch(() => {});
+    await disableNowPlayingMessage(player);
+    player.queue.length > 0 ? player.stop() : (player.destroy(), playerStates.delete(player.guildId));
+  });
+
+  // Lavalink stalled mid-stream (buffer empty, network hiccup, etc.)
+  riffy.on('trackStuck', async (player, track) => {
+    console.warn(`[trackStuck] ${player.guildId} | ${track?.info?.title}`);
+    const channel = client.channels.cache.get(player.textChannel);
+    channel?.send(`⚠️ Track stuck: **${track?.info?.title || 'track'}**. Skipping...`).catch(() => {});
+    await disableNowPlayingMessage(player);
+    player.queue.length > 0 ? player.stop() : (player.destroy(), playerStates.delete(player.guildId));
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Initial Riffy Initialization
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  INITIAL RIFFY INIT
+// ═══════════════════════════════════════════════════════════════
 try {
   riffy = new Riffy(client, lavalinkNodes, {
     send: (payload) => {
@@ -264,98 +364,57 @@ try {
     restVersion: 'v4'
   });
   attachRiffyEvents();
-} catch (error) {
-  console.error('[Riffy] Failed to initialize:', error.message);
+} catch (err) {
+  console.error('[Riffy] Init failed:', err.message);
 }
 
-const startTime = Date.now();
+// ═══════════════════════════════════════════════════════════════
+//  EXPRESS
+// ═══════════════════════════════════════════════════════════════
+app.get('/', (req, res) => res.json({
+  status:       'online',
+  bot:          client.user?.tag || 'Not Ready',
+  uptime:       formatUptime(Date.now() - startTime),
+  servers:      client.guilds.cache.size,
+  users:        getTotalUsers(),
+  lavalink:     lavalinkConnected ? 'connected' : 'disconnected',
+  reconnecting: !lavalinkConnected && lavalinkReconnectTimer !== null
+}));
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: Date.now() - startTime }));
+app.listen(PORT, () => console.log(`Express on port ${PORT}`));
 
-const playerStates = new Map();
-
-// ─────────────────────────────────────────────────────────────
-//  Express Server
-// ─────────────────────────────────────────────────────────────
-
-// FIX: helper to get total user count without privileged intents
-function getTotalUsers() {
-  return client.guilds.cache.reduce((acc, guild) => acc + guild.memberCount, 0);
-}
-
-app.get('/', (req, res) => {
-  res.json({
-    status: 'online',
-    bot: client.user?.tag || 'Not Ready',
-    uptime: formatUptime(Date.now() - startTime),
-    servers: client.guilds.cache.size,
-    users: getTotalUsers(),
-    lavalink: lavalinkConnected ? 'connected' : 'disconnected',
-    lavalinkReconnecting: !lavalinkConnected && lavalinkReconnectTimer !== null
-  });
-});
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', uptime: Date.now() - startTime });
-});
-
-app.listen(PORT, () => {
-  console.log(`Express server running on port ${PORT}`);
-});
-
-// ─────────────────────────────────────────────────────────────
-//  Command Aliases
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  COMMAND ALIASES
+// ═══════════════════════════════════════════════════════════════
 const commands = {
-  play: ['play', 'p'],
-  pause: ['pause'],
-  resume: ['resume', 'r'],
-  skip: ['skip', 's', 'next'],
-  stop: ['stop', 'disconnect', 'dc'],
-  queue: ['queue', 'q'],
+  play:       ['play', 'p'],
+  pause:      ['pause'],
+  resume:     ['resume', 'r'],
+  skip:       ['skip', 's', 'next'],
+  stop:       ['stop', 'disconnect', 'dc'],
+  queue:      ['queue', 'q'],
   nowplaying: ['nowplaying', 'np', 'current'],
-  join: ['join', 'connect'],
-  leave: ['leave'],
-  volume: ['volume', 'vol', 'v'],
-  loop: ['loop', 'repeat'],
-  shuffle: ['shuffle', 'sh'],
+  join:       ['join', 'connect'],
+  leave:      ['leave'],
+  volume:     ['volume', 'vol', 'v'],
+  loop:       ['loop', 'repeat'],
+  shuffle:    ['shuffle', 'sh'],
   clearqueue: ['clearqueue', 'cq', 'clear'],
-  remove: ['remove', 'rm'],
-  move: ['move', 'mv'],
-  search: ['search', 'find'],
-  lyrics: ['lyrics', 'ly'],
-  '247': ['247', '24/7', 'stay'],
-  help: ['help', 'h', 'commands'],
-  ping: ['ping'],
-  uptime: ['uptime', 'ut'],
-  botinfo: ['botinfo', 'bi', 'info'],
-  stats: ['stats', 'statistics'],
-  support: ['support'],
-  invite: ['invite', 'inv'],
-  vote: ['vote'],
-  restart: ['restart']
+  remove:     ['remove', 'rm'],
+  move:       ['move', 'mv'],
+  search:     ['search', 'find'],
+  lyrics:     ['lyrics', 'ly'],
+  '247':      ['247', '24/7', 'stay'],
+  help:       ['help', 'h', 'commands'],
+  ping:       ['ping'],
+  uptime:     ['uptime', 'ut'],
+  botinfo:    ['botinfo', 'bi', 'info'],
+  stats:      ['stats', 'statistics'],
+  support:    ['support'],
+  invite:     ['invite', 'inv'],
+  vote:       ['vote'],
+  restart:    ['restart']
 };
-
-// ─────────────────────────────────────────────────────────────
-//  Bot Ready
-// ─────────────────────────────────────────────────────────────
-client.once('ready', () => {
-  if (riffy) riffy.init(client.user.id);
-
-  client.user.setPresence({
-    activities: [{ name: `@${client.user.username} help`, type: ActivityType.Listening }],
-    status: 'online'
-  });
-
-  console.log(`${client.user.tag} is ready!`);
-
-  if (!lavalinkConnected) {
-    console.log('[Lavalink] Not connected on startup — starting reconnect loop...');
-    startLavalinkReconnect();
-  }
-});
-
-client.on('raw', (d) => {
-  if (riffy) riffy.updateVoiceState(d);
-});
 
 function getCommand(input) {
   for (const [cmd, aliases] of Object.entries(commands)) {
@@ -364,922 +423,534 @@ function getCommand(input) {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Message Handler
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  BOT READY
+// ═══════════════════════════════════════════════════════════════
+client.once('ready', () => {
+  if (riffy) riffy.init(client.user.id);
+  client.user.setPresence({
+    activities: [{ name: `@${client.user.username} help`, type: ActivityType.Listening }],
+    status: 'online'
+  });
+  console.log(`${client.user.tag} is ready!`);
+  if (!lavalinkConnected) startLavalinkReconnect();
+});
+
+client.on('raw', (d) => { if (riffy) riffy.updateVoiceState(d); });
+
+// ═══════════════════════════════════════════════════════════════
+//  MESSAGE HANDLER
+// ═══════════════════════════════════════════════════════════════
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  if (message.content.trim() === `<@!${client.user.id}>` || message.content.trim() === `<@${client.user.id}>`) {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`🎵 ${client.user.username}`)
-      .setDescription(`Hello! To see all my commands, please use \`@${client.user.username} help\``)
-      .setFooter({ text: 'Use me by mentioning me followed by a command' });
-    return message.reply({ embeds: [embed] });
+  const mentionOnly =
+    message.content.trim() === `<@!${client.user.id}>` ||
+    message.content.trim() === `<@${client.user.id}>`;
+
+  if (mentionOnly) {
+    return message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(config.color.info)
+        .setTitle(`🎵 ${client.user.username}`)
+        .setDescription(`Use \`@${client.user.username} help\` to see all commands.`)
+        .setFooter({ text: 'Mention me followed by a command' })]
+    });
   }
 
   if (!message.mentions.has(client.user.id)) return;
 
-  const args = message.content.split(' ').slice(1);
-  const input = args[0]?.toLowerCase();
+  const args    = message.content.split(' ').slice(1);
+  const input   = args[0]?.toLowerCase();
   const command = getCommand(input);
-
   if (!command) return;
 
+  // ── restart ──────────────────────────────────────────────────
   if (command === 'restart') {
     if (message.author.id !== config.ownerId) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ This command is owner-only!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Owner only!')] });
     }
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription('🔄 Restarting bot...');
-
-    await message.reply({ embeds: [embed] });
-
-    console.log('Bot restart initiated by owner');
+    await message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription('🔄 Restarting...')] });
     await client.destroy();
     process.exit(0);
   }
 
-  const musicCommands = ['play', 'pause', 'resume', 'skip', 'stop', 'queue', 'nowplaying', 'volume', 'loop', 'shuffle', 'clearqueue', 'remove', 'move', 'search', 'lyrics', 'join', 'leave'];
-  if (musicCommands.includes(command) && !lavalinkConnected) {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.error)
-      .setTitle('❌ Lavalink Offline')
-      .setDescription('Music features are currently unavailable. Attempting to reconnect automatically — please try again in a few minutes.');
-    return message.reply({ embeds: [embed] });
+  // ── Lavalink gate ─────────────────────────────────────────────
+  const musicCmds = ['play','pause','resume','skip','stop','queue','nowplaying','volume','loop','shuffle','clearqueue','remove','move','search','lyrics','join','leave'];
+  if (musicCmds.includes(command) && !lavalinkConnected) {
+    return message.reply({
+      embeds: [new EmbedBuilder()
+        .setColor(config.color.error)
+        .setTitle('❌ Lavalink Offline')
+        .setDescription('Music is unavailable right now. Auto-reconnect is running — try again in a few minutes.')]
+    });
   }
 
-  // PLAY Command
+  // ── play ──────────────────────────────────────────────────────
   if (command === 'play') {
     if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel first!')] });
     }
-
     const query = args.slice(1).join(' ');
     if (!query) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ Please provide a song name or URL!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Provide a song name or URL!')] });
     }
 
     try {
-      // FAST FIX: resolve the track FIRST before touching the player/connection.
-      // This way the track data is ready the moment the voice connection is live,
-      // and we never sit in a setTimeout waiting blindly.
+      // Resolve FIRST — track data ready before we even touch the VC
       const resolve = await riffy.resolve({ query, requester: message.author.id });
-
       if (resolve.loadType === 'error' || resolve.loadType === 'empty') {
-        const embed = new EmbedBuilder()
-          .setColor(config.color.error)
-          .setDescription('❌ No results found!');
-        return message.reply({ embeds: [embed] });
+        return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No results found!')] });
       }
 
-      // Now get-or-create the player AFTER we have track data
       let player = riffy.players.get(message.guild.id);
-      const isNewConnection = !player;
-
+      const isNew = !player;
       if (!player) {
         player = riffy.createConnection({
-          guildId: message.guild.id,
-          voiceChannel: message.member.voice.channel.id,
-          textChannel: message.channel.id,
-          deaf: true
+          guildId: message.guild.id, voiceChannel: message.member.voice.channel.id,
+          textChannel: message.channel.id, deaf: true
         });
       }
 
       const tracks = resolve.loadType === 'playlist' ? resolve.tracks : [resolve.tracks[0]];
 
       if (resolve.loadType === 'playlist') {
-        for (const t of tracks) {
-          t.info.requester = message.author.id;
-          player.queue.add(t);
-        }
-        const embed = new EmbedBuilder()
-          .setColor(config.color.info)
-          .setTitle('📃 Playlist Added')
-          .setDescription(`**${resolve.playlistInfo.name}**`)
-          .addFields({ name: 'Tracks', value: `${tracks.length}`, inline: true });
-        message.reply({ embeds: [embed] });
+        for (const t of tracks) { t.info.requester = message.author.id; player.queue.add(t); }
+        message.reply({
+          embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📃 Playlist Added')
+            .setDescription(`**${resolve.playlistInfo.name}**`)
+            .addFields({ name: 'Tracks', value: `${tracks.length}`, inline: true })]
+        });
       } else {
         tracks[0].info.requester = message.author.id;
         player.queue.add(tracks[0]);
-
-        const embed = new EmbedBuilder()
-          .setColor(config.color.info)
-          .setTitle('✅ Added to Queue')
-          .setDescription(`[${tracks[0].info.title}](${tracks[0].info.uri})`)
-          .setThumbnail(tracks[0].info.thumbnail || tracks[0].info.artworkUrl || null)
-          .addFields(
-            { name: 'Artist', value: tracks[0].info.author || 'Unknown', inline: true },
-            { name: 'Duration', value: formatTime(tracks[0].info.length), inline: true },
-            { name: 'Position', value: `${player.queue.length}`, inline: true }
-          );
-        message.reply({ embeds: [embed] });
+        message.reply({
+          embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('✅ Added to Queue')
+            .setDescription(`[${tracks[0].info.title}](${tracks[0].info.uri})`)
+            .setThumbnail(tracks[0].info.thumbnail || tracks[0].info.artworkUrl || null)
+            .addFields(
+              { name: 'Artist',   value: tracks[0].info.author || 'Unknown', inline: true },
+              { name: 'Duration', value: formatTime(tracks[0].info.length),   inline: true },
+              { name: 'Position', value: `${player.queue.length}`,            inline: true }
+            )]
+        });
       }
 
       if (!player.playing && !player.paused) {
-        if (isNewConnection) {
-          // FAST FIX: wait for voice state handshake (VOICE_STATE_UPDATE +
-          // VOICE_SERVER_UPDATE) instead of a blind 500 ms delay.
-          // Riffy sets player.voiceChannel once both packets arrive; poll for it.
-          await waitForVoiceReady(player);
-        }
-        player.play();
+        if (isNew) await waitForVoiceReady(player);
+        await safePlay(player, message.channel.id);
       }
-    } catch (error) {
-      console.error('[Play]', error);
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ An error occurred while loading the track.');
-      message.reply({ embeds: [embed] });
+    } catch (err) {
+      console.error('[play]', err);
+      message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ An error occurred while loading the track.')] });
     }
   }
 
-  // SEARCH Command
+  // ── search ────────────────────────────────────────────────────
   if (command === 'search') {
     if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel first!')] });
     }
-
     const query = args.slice(1).join(' ');
     if (!query) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ Please provide a search query!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Provide a search query!')] });
     }
 
     try {
       const resolve = await riffy.resolve({ query });
-
       if (resolve.loadType === 'error' || resolve.loadType === 'empty') {
-        const embed = new EmbedBuilder()
-          .setColor(config.color.error)
-          .setDescription('❌ No results found!');
-        return message.reply({ embeds: [embed] });
+        return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No results found!')] });
       }
 
-      const tracks = resolve.tracks.slice(0, 10);
-      const options = tracks.map((track, i) => ({
-        label: track.info.title.substring(0, 100),
-        description: `${track.info.author} - ${formatTime(track.info.length)}`.substring(0, 100),
-        value: `search_${i}`
+      const tracks  = resolve.tracks.slice(0, 10);
+      const options = tracks.map((t, i) => ({
+        label:       t.info.title.substring(0, 100),
+        description: `${t.info.author} - ${formatTime(t.info.length)}`.substring(0, 100),
+        value:       `search_${i}`
       }));
 
-      const row = new ActionRowBuilder().addComponents(
-        new StringSelectMenuBuilder()
-          .setCustomId('search_select')
-          .setPlaceholder('Select a song to play')
-          .addOptions(options)
-      );
-
-      const embed = new EmbedBuilder()
-        .setColor(config.color.info)
-        .setTitle('🔍 Search Results')
-        .setDescription(tracks.map((t, i) => `**${i + 1}.** [${t.info.title}](${t.info.uri})\n${t.info.author} - ${formatTime(t.info.length)}`).join('\n\n'))
-        .setFooter({ text: 'Select a song from the dropdown below' });
-
-      const msg = await message.reply({ embeds: [embed], components: [row] });
-
-      const collector = msg.createMessageComponentCollector({
-        componentType: ComponentType.StringSelect,
-        time: 60000
+      const msg = await message.reply({
+        embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🔍 Search Results')
+          .setDescription(tracks.map((t, i) => `**${i+1}.** [${t.info.title}](${t.info.uri})\n${t.info.author} - ${formatTime(t.info.length)}`).join('\n\n'))
+          .setFooter({ text: 'Select from the dropdown below' })],
+        components: [new ActionRowBuilder().addComponents(
+          new StringSelectMenuBuilder().setCustomId('search_select').setPlaceholder('Select a song').addOptions(options)
+        )]
       });
+
+      const collector = msg.createMessageComponentCollector({ componentType: ComponentType.StringSelect, time: 60000 });
 
       collector.on('collect', async (i) => {
         if (i.user.id !== message.author.id) {
           return i.reply({ content: '❌ This is not your search!', flags: [MessageFlags.Ephemeral] });
         }
-
-        const index = parseInt(i.values[0].split('_')[1]);
-        const selected = tracks[index];
-
-        let player = riffy.players.get(message.guild.id);
-        const isNewConnection = !player;
-
+        const selected = tracks[parseInt(i.values[0].split('_')[1])];
+        let player     = riffy.players.get(message.guild.id);
+        const isNew    = !player;
         if (!player) {
           player = riffy.createConnection({
-            guildId: message.guild.id,
-            voiceChannel: message.member.voice.channel.id,
-            textChannel: message.channel.id,
-            deaf: true
+            guildId: message.guild.id, voiceChannel: message.member.voice.channel.id,
+            textChannel: message.channel.id, deaf: true
           });
         }
-
         selected.info.requester = message.author.id;
         player.queue.add(selected);
-
-        const addEmbed = new EmbedBuilder()
-          .setColor(config.color.success)
-          .setDescription(`✅ Added **${selected.info.title}** to queue!`);
-
-        await i.update({ embeds: [addEmbed], components: [] });
-
+        await i.update({
+          embeds: [new EmbedBuilder().setColor(config.color.success).setDescription(`✅ Added **${selected.info.title}** to queue!`)],
+          components: []
+        });
         if (!player.playing && !player.paused) {
-          if (isNewConnection) await waitForVoiceReady(player);
-          player.play();
+          if (isNew) await waitForVoiceReady(player);
+          await safePlay(player, message.channel.id);
         }
         collector.stop();
       });
 
-      collector.on('end', () => {
-        msg.edit({ components: [] }).catch(() => {});
-      });
-    } catch (error) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ An error occurred while searching.');
-      message.reply({ embeds: [embed] });
+      collector.on('end', () => msg.edit({ components: [] }).catch(() => {}));
+    } catch (err) {
+      message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ An error occurred while searching.')] });
     }
   }
 
-  // PAUSE Command
+  // ── pause ─────────────────────────────────────────────────────
   if (command === 'pause') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    if (!player || !player.playing) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     player.pause(true);
-    const embed = new EmbedBuilder().setColor(config.color.info).setDescription('⏸️ Paused the music!');
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription('⏸️ Paused!')] });
   }
 
-  // RESUME Command
+  // ── resume ────────────────────────────────────────────────────
   if (command === 'resume') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     player.pause(false);
-    const embed = new EmbedBuilder().setColor(config.color.info).setDescription('▶️ Resumed the music!');
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription('▶️ Resumed!')] });
   }
 
-  // SKIP Command
+  // ── skip ──────────────────────────────────────────────────────
   if (command === 'skip') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const skipped = player.current;
-
-    // FIX: disable and clear the now playing message before stopping
+    if (!player || !player.current) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    const title = player.current.info.title;
     await disableNowPlayingMessage(player);
-
     player.stop();
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`⏭️ Skipped: **${skipped.info.title}**`);
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`⏭️ Skipped: **${title}**`)] });
   }
 
-  // STOP Command
+  // ── stop ──────────────────────────────────────────────────────
   if (command === 'stop') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    // FIX: disable and clear before destroying
+    if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     await disableNowPlayingMessage(player);
-
     player.destroy();
     playerStates.delete(message.guild.id);
-    const embed = new EmbedBuilder().setColor(config.color.info).setDescription('⏹️ Stopped and disconnected!');
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription('⏹️ Stopped and disconnected!')] });
   }
 
-  // QUEUE Command
+  // ── queue ─────────────────────────────────────────────────────
   if (command === 'queue') {
     const player = riffy.players.get(message.guild.id);
-
-    // FIX: also check player.playing so stale player isn't shown after queue end
     if (!player || !player.current || !player.playing) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     }
-
-    const queue = player.queue;
-    const current = player.current;
+    const q     = player.queue;
     const state = playerStates.get(message.guild.id);
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle('🎵 Music Queue')
-      .setDescription(`**Now Playing:**\n[${current.info.title}](${current.info.uri}) - ${current.info.author}\n\n**Up Next:**\n${
-        queue.length > 0
-          ? queue.slice(0, 10).map((track, i) => `\`${i + 1}.\` [${track.info.title}](${track.info.uri}) - ${track.info.author}`).join('\n')
-          : 'No tracks in queue'
-      }${queue.length > 10 ? `\n\n*And ${queue.length - 10} more...*` : ''}`)
-      .setFooter({ text: `Total tracks: ${queue.length + 1} | Loop: ${state?.loop || 'off'} | 24/7: ${state?.stay247 ? 'on' : 'off'}` });
-
-    message.reply({ embeds: [embed] });
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🎵 Music Queue')
+        .setDescription(
+          `**Now Playing:**\n[${player.current.info.title}](${player.current.info.uri}) - ${player.current.info.author}\n\n**Up Next:**\n${
+            q.length > 0
+              ? q.slice(0,10).map((t,i) => `\`${i+1}.\` [${t.info.title}](${t.info.uri}) - ${t.info.author}`).join('\n')
+              : 'No tracks in queue'
+          }${q.length > 10 ? `\n\n*And ${q.length-10} more...*` : ''}`
+        )
+        .setFooter({ text: `Total: ${q.length+1} | Loop: ${state?.loop || 'off'} | 24/7: ${state?.stay247 ? 'on' : 'off'}` })]
+    });
   }
 
-  // NOW PLAYING Command
+  // ── nowplaying ────────────────────────────────────────────────
   if (command === 'nowplaying') {
     const player = riffy.players.get(message.guild.id);
-
-    // FIX: check player.playing so we don't show a stale current track
     if (!player || !player.current || !player.playing) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     }
-
-    const track = player.current;
-    const currentTime = player.position || 0;
-    const totalTime = track.info.length;
-
-    // FIX: clamp progress to [0, 20] so position never shows as 1 when at 0ms
-    const rawProgress = totalTime > 0 ? currentTime / totalTime : 0;
-    const progress = Math.min(20, Math.max(0, Math.floor(rawProgress * 20)));
-    const progressBar = '▬'.repeat(progress) + '🔘' + '▬'.repeat(20 - progress);
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle('🎵 Now Playing')
-      .setDescription(`[${track.info.title}](${track.info.uri})`)
-      .setThumbnail(track.info.thumbnail || track.info.artworkUrl || null)
-      .addFields(
-        { name: 'Artist', value: track.info.author || 'Unknown', inline: true },
-        { name: 'Duration', value: `${formatTime(currentTime)} / ${formatTime(totalTime)}`, inline: true },
-        { name: 'Status', value: player.paused ? '⏸️ Paused' : '▶️ Playing', inline: true },
-        { name: 'Progress', value: progressBar, inline: false },
-        { name: 'Requested by', value: `<@${track.info.requester}>`, inline: true },
-        { name: 'Volume', value: `${player.volume}%`, inline: true }
-      );
-
-    message.reply({ embeds: [embed] });
-  }
-
-  // JOIN Command
-  if (command === 'join') {
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    let player = riffy.players.get(message.guild.id);
-    if (player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Already connected to a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    riffy.createConnection({
-      guildId: message.guild.id,
-      voiceChannel: message.member.voice.channel.id,
-      textChannel: message.channel.id,
-      deaf: true
+    const track    = player.current;
+    const cur      = player.position || 0;
+    const tot      = track.info.length;
+    const progress = Math.min(20, Math.max(0, Math.floor((cur / tot) * 20)));
+    const bar      = '▬'.repeat(progress) + '🔘' + '▬'.repeat(20 - progress);
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🎵 Now Playing')
+        .setDescription(`[${track.info.title}](${track.info.uri})`)
+        .setThumbnail(track.info.thumbnail || track.info.artworkUrl || null)
+        .addFields(
+          { name: 'Artist',       value: track.info.author || 'Unknown',          inline: true },
+          { name: 'Duration',     value: `${formatTime(cur)} / ${formatTime(tot)}`, inline: true },
+          { name: 'Status',       value: player.paused ? '⏸️ Paused' : '▶️ Playing', inline: true },
+          { name: 'Progress',     value: bar,                                      inline: false },
+          { name: 'Requested by', value: `<@${track.info.requester}>`,             inline: true },
+          { name: 'Volume',       value: `${player.volume}%`,                     inline: true }
+        )]
     });
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.success)
-      .setDescription(`✅ Joined ${message.member.voice.channel.name}`);
-    message.reply({ embeds: [embed] });
   }
 
-  // LEAVE Command
+  // ── join ──────────────────────────────────────────────────────
+  if (command === 'join') {
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    if (riffy.players.get(message.guild.id)) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Already in a voice channel!')] });
+    riffy.createConnection({ guildId: message.guild.id, voiceChannel: message.member.voice.channel.id, textChannel: message.channel.id, deaf: true });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.success).setDescription(`✅ Joined **${message.member.voice.channel.name}**`)] });
+  }
+
+  // ── leave ─────────────────────────────────────────────────────
   if (command === 'leave') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Not connected to a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Not in a voice channel!')] });
     await disableNowPlayingMessage(player);
     player.destroy();
     playerStates.delete(message.guild.id);
-    const embed = new EmbedBuilder().setColor(config.color.info).setDescription('👋 Disconnected from voice channel!');
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription('👋 Disconnected!')] });
   }
 
-  // VOLUME Command
+  // ── volume ────────────────────────────────────────────────────
   if (command === 'volume') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
+    if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    const vol = parseInt(args[1]);
+    if (isNaN(vol) || vol < 0 || vol > 100) {
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🔊 Current volume: **${player.volume}%**\n\nUsage: \`volume <0-100>\``)] });
     }
-
-    const volume = parseInt(args[1]);
-    if (isNaN(volume) || volume < 0 || volume > 100) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.info)
-        .setDescription(`🔊 Current volume: **${player.volume}%**\n\nUsage: \`@${client.user.username} volume <0-100>\``);
-      return message.reply({ embeds: [embed] });
-    }
-
-    player.setVolume(volume);
-    const embed = new EmbedBuilder().setColor(config.color.info).setDescription(`🔊 Volume set to **${volume}%**`);
-    message.reply({ embeds: [embed] });
+    player.setVolume(vol);
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🔊 Volume set to **${vol}%**`)] });
   }
 
-  // LOOP Command
+  // ── loop ──────────────────────────────────────────────────────
   if (command === 'loop') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || !player.current) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    if (!player || !player.current) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     const state = playerStates.get(message.guild.id) || {};
     const modes = ['off', 'track', 'queue'];
-    const currentMode = state.loop || 'off';
-    const nextMode = modes[(modes.indexOf(currentMode) + 1) % modes.length];
-
-    state.loop = nextMode;
+    const next  = modes[(modes.indexOf(state.loop || 'off') + 1) % modes.length];
+    state.loop  = next;
     playerStates.set(message.guild.id, state);
-
-    if (nextMode === 'track') {
-      player.setLoop('track');
-    } else if (nextMode === 'queue') {
-      player.setLoop('queue');
-    } else {
-      player.setLoop('none');
-    }
-
-    const modeEmoji = { off: '➡️', track: '🔂', queue: '🔁' };
-    const modeDesc = {
-      off: 'Loop disabled',
-      track: 'Looping current track',
-      queue: 'Looping entire queue'
-    };
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`${modeEmoji[nextMode]} Loop: **${modeDesc[nextMode]}**`);
-    message.reply({ embeds: [embed] });
+    player.setLoop(next === 'off' ? 'none' : next);
+    const emoji = { off: '➡️', track: '🔂', queue: '🔁' };
+    const desc  = { off: 'Loop disabled', track: 'Looping current track', queue: 'Looping entire queue' };
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`${emoji[next]} **${desc[next]}**`)] });
   }
 
-  // 24/7 Command
+  // ── 247 ───────────────────────────────────────────────────────
   if (command === '247') {
     const player = riffy.players.get(message.guild.id);
-    if (!player) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const state = playerStates.get(message.guild.id) || {};
+    if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    const state   = playerStates.get(message.guild.id) || {};
     state.stay247 = !state.stay247;
     playerStates.set(message.guild.id, state);
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`🎵 24/7 Mode: **${state.stay247 ? 'enabled' : 'disabled'}**`);
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🎵 24/7 Mode: **${state.stay247 ? 'enabled' : 'disabled'}**`)] });
   }
 
-  // SHUFFLE Command
+  // ── shuffle ───────────────────────────────────────────────────
   if (command === 'shuffle') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || player.queue.length === 0) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     player.queue.shuffle();
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`🔀 Shuffled **${player.queue.length}** tracks!`);
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🔀 Shuffled **${player.queue.length}** tracks!`)] });
   }
 
-  // CLEARQUEUE Command
+  // ── clearqueue ────────────────────────────────────────────────
   if (command === 'clearqueue') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || player.queue.length === 0) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const cleared = player.queue.length;
+    if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    const n = player.queue.length;
     player.queue.clear();
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`🗑️ Cleared **${cleared}** tracks from queue!`);
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🗑️ Cleared **${n}** tracks!`)] });
   }
 
-  // REMOVE Command
+  // ── remove ────────────────────────────────────────────────────
   if (command === 'remove') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || player.queue.length === 0) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
-      return message.reply({ embeds: [embed] });
+    if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    const pos = parseInt(args[1]);
+    if (!pos || pos < 1 || pos > player.queue.length) {
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription(`❌ Valid range: 1–${player.queue.length}`)] });
     }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const position = parseInt(args[1]);
-    if (!position || position < 1 || position > player.queue.length) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription(`❌ Please provide a valid position (1-${player.queue.length})!`);
-      return message.reply({ embeds: [embed] });
-    }
-
-    const removed = player.queue.remove(position - 1);
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`🗑️ Removed: **${removed.info.title}**`);
-    message.reply({ embeds: [embed] });
+    const removed = player.queue.remove(pos - 1);
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`🗑️ Removed: **${removed.info.title}**`)] });
   }
 
-  // MOVE Command
+  // ── move ──────────────────────────────────────────────────────
   if (command === 'move') {
     const player = riffy.players.get(message.guild.id);
-    if (!player || player.queue.length === 0) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!');
-      return message.reply({ embeds: [embed] });
-    }
-    if (!message.member.voice.channel) {
-      const embed = new EmbedBuilder().setColor(config.color.error).setDescription('❌ You need to be in a voice channel!');
-      return message.reply({ embeds: [embed] });
-    }
-
-    const from = parseInt(args[1]);
-    const to = parseInt(args[2]);
-
+    if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
+    if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
+    const from = parseInt(args[1]), to = parseInt(args[2]);
     if (!from || !to || from < 1 || to < 1 || from > player.queue.length || to > player.queue.length) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription(`❌ Usage: \`@${client.user.username} move <from> <to>\`\nValid range: 1-${player.queue.length}`);
-      return message.reply({ embeds: [embed] });
+      return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription(`❌ Usage: \`move <from> <to>\` (range 1–${player.queue.length})`)] });
     }
-
     const track = player.queue[from - 1];
     player.queue.splice(from - 1, 1);
     player.queue.splice(to - 1, 0, track);
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setDescription(`📋 Moved **${track.info.title}** from position ${from} to ${to}`);
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setDescription(`📋 Moved **${track.info.title}** from #${from} to #${to}`)] });
   }
 
-  // LYRICS Command
+  // ── lyrics ────────────────────────────────────────────────────
   if (command === 'lyrics') {
     const player = riffy.players.get(message.guild.id);
-    let searchQuery = args.slice(1).join(' ');
-
-    if (!searchQuery && player && player.current) {
-      searchQuery = player.current.info.title;
-    }
-
-    if (!searchQuery) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ Please provide a song name or play a song!');
-      return message.reply({ embeds: [embed] });
-    }
-
+    let q = args.slice(1).join(' ');
+    if (!q && player?.current) q = player.current.info.title;
+    if (!q) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Provide a song name or play something!')] });
     try {
-      const response = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(searchQuery)}`);
-      const data = await response.json();
-
-      if (!data || data.length === 0) {
-        const embed = new EmbedBuilder()
-          .setColor(config.color.error)
-          .setDescription('❌ No lyrics found!');
-        return message.reply({ embeds: [embed] });
-      }
-
-      const song = data[0];
-      let lyrics = song.plainLyrics || song.syncedLyrics || 'Lyrics not available';
-
-      if (lyrics.length > 4000) {
-        lyrics = lyrics.substring(0, 4000) + '...';
-      }
-
-      const embed = new EmbedBuilder()
-        .setColor(config.color.info)
-        .setTitle(`🎤 ${song.trackName}`)
-        .setDescription(lyrics)
-        .setFooter({ text: `Artist: ${song.artistName} | Album: ${song.albumName || 'Unknown'}` });
-
-      message.reply({ embeds: [embed] });
-    } catch (error) {
-      const embed = new EmbedBuilder()
-        .setColor(config.color.error)
-        .setDescription('❌ Failed to fetch lyrics!');
-      message.reply({ embeds: [embed] });
+      const res  = await fetch(`https://lrclib.net/api/search?q=${encodeURIComponent(q)}`);
+      const data = await res.json();
+      if (!data?.length) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No lyrics found!')] });
+      const song   = data[0];
+      let   lyrics = song.plainLyrics || song.syncedLyrics || 'Lyrics not available';
+      if (lyrics.length > 4000) lyrics = lyrics.substring(0, 4000) + '...';
+      message.reply({
+        embeds: [new EmbedBuilder().setColor(config.color.info).setTitle(`🎤 ${song.trackName}`)
+          .setDescription(lyrics)
+          .setFooter({ text: `Artist: ${song.artistName} | Album: ${song.albumName || 'Unknown'}` })]
+      });
+    } catch {
+      message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Failed to fetch lyrics!')] });
     }
   }
 
-  // HELP Command
+  // ── help ──────────────────────────────────────────────────────
   if (command === 'help') {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`🎵 ${client.user.username} Commands`)
-      .setDescription(`Mention me with a command! Example: \`@${client.user.username} play song name\`\n\u200b`)
-      .setThumbnail(client.user.displayAvatarURL())
-      .addFields(
-        {
-          name: '🎵 Music Commands',
-          value: [
-            '**Playback:**',
-            '`play (p)` • `search (find)` • `pause` • `resume (r)` • `skip (s)` • `stop (dc)`',
-            '',
-            '**Queue Management:**',
-            '`queue (q)` • `clearqueue (cq)` • `shuffle (sh)` • `remove (rm)` • `move (mv)`',
-            '',
-            '**Modes:**',
-            '`loop` • `247`',
-            '',
-            '**Other:**',
-            '`nowplaying (np)` • `join` • `leave` • `volume (vol)` • `lyrics (ly)`'
-          ].join('\n'),
-          inline: false
-        },
-        {
-          name: '\u200b',
-          value: '\u200b',
-          inline: false
-        },
-        {
-          name: '🔧 Utility Commands',
-          value: '`ping` • `uptime (ut)` • `botinfo (bi)` • `stats` • `support` • `invite (inv)` • `vote`',
-          inline: false
-        },
-        {
-          name: '\u200b',
-          value: '\u200b',
-          inline: false
-        },
-        {
-          name: '💡 Command Info',
-          value: '• Commands in parentheses **(p, r, s)** are shortcuts\n• Use `@mention command` to interact with the bot',
-          inline: false
-        }
-      )
-      .setFooter({ text: `Requested by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() });
-
     const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot`;
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setLabel('Invite Me')
-        .setURL(inviteUrl)
-        .setStyle(ButtonStyle.Link),
-      new ButtonBuilder()
-        .setLabel('Support Server')
-        .setURL(config.supportServer)
-        .setStyle(ButtonStyle.Link)
-    );
-
-    message.reply({ embeds: [embed], components: [row] });
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info)
+        .setTitle(`🎵 ${client.user.username} Commands`)
+        .setDescription(`Use \`@${client.user.username} <command>\`\n\u200b`)
+        .setThumbnail(client.user.displayAvatarURL())
+        .addFields(
+          { name: '🎵 Music', value: '`play (p)` • `search` • `pause` • `resume (r)` • `skip (s)` • `stop (dc)`\n`queue (q)` • `clearqueue (cq)` • `shuffle (sh)` • `remove (rm)` • `move (mv)`\n`loop` • `247` • `nowplaying (np)` • `join` • `leave` • `volume (vol)` • `lyrics (ly)`', inline: false },
+          { name: '🔧 Utility', value: '`ping` • `uptime (ut)` • `botinfo (bi)` • `stats` • `support` • `invite (inv)` • `vote`', inline: false },
+          { name: '💡 Tip', value: 'Aliases shown in `(brackets)` are shortcuts.', inline: false }
+        )
+        .setFooter({ text: `Requested by ${message.author.tag}`, iconURL: message.author.displayAvatarURL() })],
+      components: [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setLabel('Invite Me').setURL(inviteUrl).setStyle(ButtonStyle.Link),
+        new ButtonBuilder().setLabel('Support Server').setURL(config.supportServer).setStyle(ButtonStyle.Link)
+      )]
+    });
   }
 
-  // PING Command
+  // ── ping ──────────────────────────────────────────────────────
   if (command === 'ping') {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle('🏓 Pong!')
-      .addFields(
-        { name: 'API Latency', value: `${Math.round(client.ws.ping)}ms`, inline: true },
-        { name: 'Lavalink', value: lavalinkConnected ? '✅ Connected' : '❌ Offline (reconnecting...)', inline: true }
-      );
-
-    message.reply({ embeds: [embed] });
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🏓 Pong!')
+        .addFields(
+          { name: 'API Latency', value: `${Math.round(client.ws.ping)}ms`,                      inline: true },
+          { name: 'Lavalink',    value: lavalinkConnected ? '✅ Connected' : '❌ Offline', inline: true }
+        )]
+    });
   }
 
-  // UPTIME Command
+  // ── uptime ────────────────────────────────────────────────────
   if (command === 'uptime') {
-    const uptime = Date.now() - startTime;
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`⏰ ${client.user.username} Uptime`)
-      .setDescription(`\`${formatUptime(uptime)}\``);
-
-    message.reply({ embeds: [embed] });
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('⏰ Uptime').setDescription(`\`${formatUptime(Date.now() - startTime)}\``)] });
   }
 
-  // BOTINFO Command
+  // ── botinfo ───────────────────────────────────────────────────
   if (command === 'botinfo') {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`ℹ️ ${client.user.username} Information`)
-      .setThumbnail(client.user.displayAvatarURL())
-      .addFields(
-        { name: 'Bot Tag', value: client.user.tag, inline: true },
-        { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        // FIX: use guild.memberCount sum — no privileged intent required
-        { name: 'Users', value: `${getTotalUsers()}`, inline: true },
-        { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
-        { name: 'Node.js', value: process.version, inline: true },
-        { name: 'Library', value: 'discord.js', inline: true }
-      );
-
-    message.reply({ embeds: [embed] });
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info).setTitle(`ℹ️ ${client.user.username}`)
+        .setThumbnail(client.user.displayAvatarURL())
+        .addFields(
+          { name: 'Bot Tag',  value: client.user.tag,                     inline: true },
+          { name: 'Servers',  value: `${client.guilds.cache.size}`,        inline: true },
+          { name: 'Users',    value: `${getTotalUsers()}`,                 inline: true },
+          { name: 'Uptime',   value: formatUptime(Date.now() - startTime), inline: true },
+          { name: 'Node.js',  value: process.version,                      inline: true },
+          { name: 'Library',  value: 'discord.js',                         inline: true }
+        )]
+    });
   }
 
-  // STATS Command
+  // ── stats ─────────────────────────────────────────────────────
   if (command === 'stats') {
-    const memUsage = process.memoryUsage().heapUsed / 1024 / 1024;
-    const totalPlayers = riffy ? riffy.players.size : 0;
-
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`📊 ${client.user.username} Statistics`)
-      .addFields(
-        { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
-        // FIX: use guild.memberCount sum — no privileged intent required
-        { name: 'Users', value: `${getTotalUsers()}`, inline: true },
-        { name: 'Active Players', value: `${totalPlayers}`, inline: true },
-        { name: 'Memory Usage', value: `${memUsage.toFixed(2)} MB`, inline: true },
-        { name: 'Uptime', value: formatUptime(Date.now() - startTime), inline: true },
-        { name: 'Lavalink', value: lavalinkConnected ? '✅ Online' : `❌ Offline (reconnecting...)`, inline: true }
-      );
-
-    message.reply({ embeds: [embed] });
+    const mem = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
+    message.reply({
+      embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📊 Statistics')
+        .addFields(
+          { name: 'Servers',        value: `${client.guilds.cache.size}`,        inline: true },
+          { name: 'Users',          value: `${getTotalUsers()}`,                 inline: true },
+          { name: 'Active Players', value: `${riffy?.players.size || 0}`,        inline: true },
+          { name: 'Memory',         value: `${mem} MB`,                          inline: true },
+          { name: 'Uptime',         value: formatUptime(Date.now() - startTime), inline: true },
+          { name: 'Lavalink',       value: lavalinkConnected ? '✅ Online' : '❌ Offline', inline: true }
+        )]
+    });
   }
 
-  // SUPPORT Command
-  if (command === 'support') {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle('💬 Support Server')
-      .setDescription(`[Click here to join](${config.supportServer})`);
-
-    message.reply({ embeds: [embed] });
-  }
-
-  // INVITE Command
-  if (command === 'invite') {
-    const invite = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot`;
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`📨 Invite ${client.user.username}!`)
-      .setDescription(`[Click here to invite](${invite})`);
-
-    message.reply({ embeds: [embed] });
-  }
-
-  // VOTE Command
-  if (command === 'vote') {
-    const embed = new EmbedBuilder()
-      .setColor(config.color.info)
-      .setTitle(`🗳️ Vote for ${client.user.username}!`)
-      .setDescription(`[Vote on Top.gg](${config.voteLink})`);
-
-    message.reply({ embeds: [embed] });
-  }
+  if (command === 'support') message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('💬 Support').setDescription(`[Join here](${config.supportServer})`)] });
+  if (command === 'invite')  message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📨 Invite').setDescription(`[Invite me](https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot)`)] });
+  if (command === 'vote')    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🗳️ Vote').setDescription(`[Vote on Top.gg](${config.voteLink})`)] });
 });
 
-// ─────────────────────────────────────────────────────────────
-//  Button Handler
-// ─────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  BUTTON HANDLER
+// ═══════════════════════════════════════════════════════════════
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isButton()) return;
 
   const player = riffy?.players.get(interaction.guild.id);
-  if (!player) {
-    return interaction.reply({ content: '❌ No music is playing!', flags: [MessageFlags.Ephemeral] });
-  }
-
-  if (!interaction.member.voice.channel) {
-    return interaction.reply({ content: '❌ You need to be in a voice channel!', flags: [MessageFlags.Ephemeral] });
+  if (!player)                        return interaction.reply({ content: '❌ No music is playing!',             flags: [MessageFlags.Ephemeral] });
+  if (!interaction.member.voice.channel) return interaction.reply({ content: '❌ Join a voice channel!',          flags: [MessageFlags.Ephemeral] });
+  if (!player.current)                return interaction.reply({ content: '❌ No track loaded!',                  flags: [MessageFlags.Ephemeral] });
+  if (interaction.user.id !== player.current.info.requester) {
+    return interaction.reply({ content: '❌ Only the requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
   }
 
   if (interaction.customId === 'pause') {
-    if (interaction.user.id !== player.current.info.requester) {
-      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
-    }
     if (player.paused) {
       player.pause(false);
-      const row = new ActionRowBuilder().addComponents(
+      await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('pause').setEmoji('⏸️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
-      );
-      await interaction.message.edit({ components: [row] });
-      await interaction.reply({ content: '▶️ Resumed!', flags: [MessageFlags.Ephemeral] });
+      )] });
+      return interaction.reply({ content: '▶️ Resumed!', flags: [MessageFlags.Ephemeral] });
     } else {
       player.pause(true);
-      const row = new ActionRowBuilder().addComponents(
+      await interaction.message.edit({ components: [new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('pause').setEmoji('▶️').setStyle(ButtonStyle.Success),
         new ButtonBuilder().setCustomId('skip').setEmoji('⏭️').setStyle(ButtonStyle.Primary),
         new ButtonBuilder().setCustomId('stop').setEmoji('⏹️').setStyle(ButtonStyle.Danger)
-      );
-      await interaction.message.edit({ components: [row] });
-      await interaction.reply({ content: '⏸️ Paused!', flags: [MessageFlags.Ephemeral] });
+      )] });
+      return interaction.reply({ content: '⏸️ Paused!', flags: [MessageFlags.Ephemeral] });
     }
   }
 
   if (interaction.customId === 'skip') {
-    if (interaction.user.id !== player.current.info.requester) {
-      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
-    }
-    // FIX: disable and clear before stopping
     await disableNowPlayingMessage(player);
     player.stop();
-    await interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
+    return interaction.reply({ content: '⏭️ Skipped!', flags: [MessageFlags.Ephemeral] });
   }
 
   if (interaction.customId === 'stop') {
-    if (interaction.user.id !== player.current.info.requester) {
-      return interaction.reply({ content: '❌ Only the song requester can use these buttons!', flags: [MessageFlags.Ephemeral] });
-    }
-    // FIX: disable and clear before destroying
     await disableNowPlayingMessage(player);
     player.destroy();
     playerStates.delete(interaction.guild.id);
-    await interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
+    return interaction.reply({ content: '⏹️ Stopped!', flags: [MessageFlags.Ephemeral] });
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-//  Helper Functions
-// ─────────────────────────────────────────────────────────────
-function formatTime(ms) {
-  const seconds = Math.floor((ms / 1000) % 60);
-  const minutes = Math.floor((ms / (1000 * 60)) % 60);
-  const hours = Math.floor(ms / (1000 * 60 * 60));
-
-  if (hours > 0) {
-    return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-  }
-  return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-}
-
-function formatUptime(ms) {
-  const seconds = Math.floor((ms / 1000) % 60);
-  const minutes = Math.floor((ms / (1000 * 60)) % 60);
-  const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
-  const days = Math.floor(ms / (1000 * 60 * 60 * 24));
-
-  const parts = [];
-  if (days > 0) parts.push(`${days}d`);
-  if (hours > 0) parts.push(`${hours}h`);
-  if (minutes > 0) parts.push(`${minutes}m`);
-  if (seconds > 0) parts.push(`${seconds}s`);
-
-  return parts.join(' ') || '0s';
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Error Handling
-// ─────────────────────────────────────────────────────────────
-process.on('unhandledRejection', error => {
-  console.error('Unhandled promise rejection:', error);
-});
+// ═══════════════════════════════════════════════════════════════
+//  GLOBAL ERROR GUARD
+// ═══════════════════════════════════════════════════════════════
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
 
 client.login(process.env.BOT_TOKEN);
