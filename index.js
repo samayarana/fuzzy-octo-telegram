@@ -39,7 +39,7 @@ const lavalinkNodes = [{
   host:     process.env.LAVALINK_HOST     || 'lavalink.jirayu.net',
   port:     parseInt(process.env.LAVALINK_PORT) || 13592,
   password: process.env.LAVALINK_PASSWORD || 'youshallnotpass',
-  secure:   process.env.LAVALINK_SECURE === 'false'
+  secure:   process.env.LAVALINK_SECURE === 'true'
 }];
 
 const client = new Client({
@@ -426,7 +426,7 @@ function getCommand(input) {
 // ═══════════════════════════════════════════════════════════════
 //  BOT READY
 // ═══════════════════════════════════════════════════════════════
-client.once('ready', () => {
+client.once('clientReady', () => {
   if (riffy) riffy.init(client.user.id);
   client.user.setPresence({
     activities: [{ name: `@${client.user.username} help`, type: ActivityType.Listening }],
@@ -547,7 +547,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── search ────────────────────────────────────────────────────
-  if (command === 'search') {
+  else if (command === 'search') {
     if (!message.member.voice.channel) {
       return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel first!')] });
     }
@@ -613,7 +613,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── pause ─────────────────────────────────────────────────────
-  if (command === 'pause') {
+  else if (command === 'pause') {
     const player = riffy.players.get(message.guild.id);
     if (!player || !player.playing) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -622,7 +622,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── resume ────────────────────────────────────────────────────
-  if (command === 'resume') {
+  else if (command === 'resume') {
     const player = riffy.players.get(message.guild.id);
     if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -631,7 +631,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── skip ──────────────────────────────────────────────────────
-  if (command === 'skip') {
+  else if (command === 'skip') {
     const player = riffy.players.get(message.guild.id);
     if (!player || !player.current) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -642,7 +642,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── stop ──────────────────────────────────────────────────────
-  if (command === 'stop') {
+  else if (command === 'stop') {
     const player = riffy.players.get(message.guild.id);
     if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -653,7 +653,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── queue ─────────────────────────────────────────────────────
-  if (command === 'queue') {
+  else if (command === 'queue') {
     const player = riffy.players.get(message.guild.id);
     if (!player || !player.current || !player.playing) {
       return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
@@ -674,7 +674,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── nowplaying ────────────────────────────────────────────────
-  if (command === 'nowplaying') {
+  else if (command === 'nowplaying') {
     const player = riffy.players.get(message.guild.id);
     if (!player || !player.current || !player.playing) {
       return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
@@ -700,7 +700,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── join ──────────────────────────────────────────────────────
-  if (command === 'join') {
+  else if (command === 'join') {
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
     if (riffy.players.get(message.guild.id)) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Already in a voice channel!')] });
     riffy.createConnection({ guildId: message.guild.id, voiceChannel: message.member.voice.channel.id, textChannel: message.channel.id, deaf: true });
@@ -708,7 +708,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── leave ─────────────────────────────────────────────────────
-  if (command === 'leave') {
+  else if (command === 'leave') {
     const player = riffy.players.get(message.guild.id);
     if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Not in a voice channel!')] });
     await disableNowPlayingMessage(player);
@@ -718,7 +718,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── volume ────────────────────────────────────────────────────
-  if (command === 'volume') {
+  else if (command === 'volume') {
     const player = riffy.players.get(message.guild.id);
     if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     const vol = parseInt(args[1]);
@@ -730,7 +730,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── loop ──────────────────────────────────────────────────────
-  if (command === 'loop') {
+  else if (command === 'loop') {
     const player = riffy.players.get(message.guild.id);
     if (!player || !player.current) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -746,7 +746,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── 247 ───────────────────────────────────────────────────────
-  if (command === '247') {
+  else if (command === '247') {
     const player = riffy.players.get(message.guild.id);
     if (!player) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ No music is playing!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -757,7 +757,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── shuffle ───────────────────────────────────────────────────
-  if (command === 'shuffle') {
+  else if (command === 'shuffle') {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -766,7 +766,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── clearqueue ────────────────────────────────────────────────
-  if (command === 'clearqueue') {
+  else if (command === 'clearqueue') {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -776,7 +776,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── remove ────────────────────────────────────────────────────
-  if (command === 'remove') {
+  else if (command === 'remove') {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -789,7 +789,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── move ──────────────────────────────────────────────────────
-  if (command === 'move') {
+  else if (command === 'move') {
     const player = riffy.players.get(message.guild.id);
     if (!player || player.queue.length === 0) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Queue is empty!')] });
     if (!message.member.voice.channel) return message.reply({ embeds: [new EmbedBuilder().setColor(config.color.error).setDescription('❌ Join a voice channel!')] });
@@ -804,7 +804,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── lyrics ────────────────────────────────────────────────────
-  if (command === 'lyrics') {
+  else if (command === 'lyrics') {
     const player = riffy.players.get(message.guild.id);
     let q = args.slice(1).join(' ');
     if (!q && player?.current) q = player.current.info.title;
@@ -827,7 +827,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── help ──────────────────────────────────────────────────────
-  if (command === 'help') {
+  else if (command === 'help') {
     const inviteUrl = `https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot`;
     message.reply({
       embeds: [new EmbedBuilder().setColor(config.color.info)
@@ -848,7 +848,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── ping ──────────────────────────────────────────────────────
-  if (command === 'ping') {
+  else if (command === 'ping') {
     message.reply({
       embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🏓 Pong!')
         .addFields(
@@ -859,12 +859,12 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── uptime ────────────────────────────────────────────────────
-  if (command === 'uptime') {
+  else if (command === 'uptime') {
     message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('⏰ Uptime').setDescription(`\`${formatUptime(Date.now() - startTime)}\``)] });
   }
 
   // ── botinfo ───────────────────────────────────────────────────
-  if (command === 'botinfo') {
+  else if (command === 'botinfo') {
     message.reply({
       embeds: [new EmbedBuilder().setColor(config.color.info).setTitle(`ℹ️ ${client.user.username}`)
         .setThumbnail(client.user.displayAvatarURL())
@@ -880,7 +880,7 @@ client.on('messageCreate', async (message) => {
   }
 
   // ── stats ─────────────────────────────────────────────────────
-  if (command === 'stats') {
+  else if (command === 'stats') {
     const mem = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2);
     message.reply({
       embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📊 Statistics')
@@ -895,9 +895,13 @@ client.on('messageCreate', async (message) => {
     });
   }
 
-  if (command === 'support') message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('💬 Support').setDescription(`[Join here](${config.supportServer})`)] });
-  if (command === 'invite')  message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📨 Invite').setDescription(`[Invite me](https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot)`)] });
-  if (command === 'vote')    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🗳️ Vote').setDescription(`[Vote on Top.gg](${config.voteLink})`)] });
+  else if (command === 'support') {
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('💬 Support').setDescription(`[Join here](${config.supportServer})`)] });
+  } else if (command === 'invite') {
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('📨 Invite').setDescription(`[Invite me](https://discord.com/api/oauth2/authorize?client_id=${client.user.id}&permissions=36700160&scope=bot)`)] });
+  } else if (command === 'vote') {
+    message.reply({ embeds: [new EmbedBuilder().setColor(config.color.info).setTitle('🗳️ Vote').setDescription(`[Vote on Top.gg](${config.voteLink})`)] });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
