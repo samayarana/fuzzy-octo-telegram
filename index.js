@@ -152,6 +152,27 @@ client.on('raw', (d) => {
   if (riffy) riffy.updateVoiceState(d);
 });
 
+// When Discord shard reconnects, all voice sessions are invalidated — clean up players
+client.on('shardResume', () => {
+  console.log('Shard resumed — clearing stale voice players');
+  if (riffy) {
+    for (const [guildId, player] of riffy.players) {
+      try { player.destroy(); } catch (e) {}
+      playerStates.delete(guildId);
+    }
+  }
+});
+
+client.on('shardReconnecting', () => {
+  console.log('Shard reconnecting — clearing stale voice players');
+  if (riffy) {
+    for (const [guildId, player] of riffy.players) {
+      try { player.destroy(); } catch (e) {}
+      playerStates.delete(guildId);
+    }
+  }
+});
+
 // Riffy Events
 if (riffy) {
   riffy.on('nodeConnect', (node) => {
@@ -353,6 +374,13 @@ client.on('messageCreate', async (message) => {
 
     let player = riffy.players.get(message.guild.id);
 
+    // Pre-flight: idle player with empty queue = stale connection from previous session
+    if (player && !player.playing && !player.paused && player.queue.length === 0) {
+      try { player.destroy(); } catch (e) {}
+      playerStates.delete(message.guild.id);
+      player = null;
+    }
+
     if (!player) {
       player = riffy.createConnection({
         guildId: message.guild.id,
@@ -497,6 +525,14 @@ client.on('messageCreate', async (message) => {
         const selected = tracks[index];
 
         let player = riffy.players.get(message.guild.id);
+
+        // Pre-flight: idle player with empty queue = stale connection
+        if (player && !player.playing && !player.paused && player.queue.length === 0) {
+          try { player.destroy(); } catch (e) {}
+          playerStates.delete(message.guild.id);
+          player = null;
+        }
+
         if (!player) {
           player = riffy.createConnection({
             guildId: message.guild.id,
@@ -516,7 +552,24 @@ client.on('messageCreate', async (message) => {
 
         await i.update({ embeds: [addEmbed], components: [] });
 
-        if (!player.playing && !player.paused) player.play();
+        if (!player.playing && !player.paused) {
+          try {
+            player.play();
+          } catch (playError) {
+            const queuedTracks = [...player.queue];
+            try { player.destroy(); } catch (e) {}
+            playerStates.delete(message.guild.id);
+            player = riffy.createConnection({
+              guildId: message.guild.id,
+              voiceChannel: message.member.voice.channel.id,
+              textChannel: message.channel.id,
+              deaf: true
+            });
+            await new Promise(resolve => setTimeout(resolve, 600));
+            for (const t of queuedTracks) player.queue.add(t);
+            player.play();
+          }
+        }
         collector.stop();
       });
 
