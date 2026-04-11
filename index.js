@@ -278,6 +278,14 @@ if (riffy) {
   });
 }
 
+// Wait until player.connection is established (set by voice state update)
+async function waitForConnection(player, maxWait = 4000) {
+  const start = Date.now();
+  while (!player.connection && Date.now() - start < maxWait) {
+    await new Promise(r => setTimeout(r, 100));
+  }
+}
+
 // Reconnect loop for Lavalink
 function startReconnectLoop(node) {
   if (reconnectTimer) return;
@@ -434,9 +442,11 @@ client.on('messageCreate', async (message) => {
 
       if (!player.playing && !player.paused) {
         try {
-          player.play();
+          await waitForConnection(player);
+          if (!player.connection) throw new Error('Connection not established');
+          await player.play();
         } catch (playError) {
-          // Stale player — destroy it, create a fresh connection and retry
+          console.error('Play error, recreating connection:', playError.message);
           const queuedTracks = [...player.queue];
           try { player.destroy(); } catch (e) {}
           playerStates.delete(message.guild.id);
@@ -447,10 +457,10 @@ client.on('messageCreate', async (message) => {
             textChannel: message.channel.id,
             deaf: true
           });
-          await new Promise(resolve => setTimeout(resolve, 600));
+          await waitForConnection(player);
 
           for (const t of queuedTracks) player.queue.add(t);
-          player.play();
+          await player.play();
         }
       }
     } catch (error) {
@@ -554,8 +564,11 @@ client.on('messageCreate', async (message) => {
 
         if (!player.playing && !player.paused) {
           try {
-            player.play();
+            await waitForConnection(player);
+            if (!player.connection) throw new Error('Connection not established');
+            await player.play();
           } catch (playError) {
+            console.error('Search play error, recreating connection:', playError.message);
             const queuedTracks = [...player.queue];
             try { player.destroy(); } catch (e) {}
             playerStates.delete(message.guild.id);
@@ -565,9 +578,9 @@ client.on('messageCreate', async (message) => {
               textChannel: message.channel.id,
               deaf: true
             });
-            await new Promise(resolve => setTimeout(resolve, 600));
+            await waitForConnection(player);
             for (const t of queuedTracks) player.queue.add(t);
-            player.play();
+            await player.play();
           }
         }
         collector.stop();
